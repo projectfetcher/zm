@@ -1,0 +1,96 @@
+# ─────────────────────────────────────────────────────────────────
+# GitHub Actions — Zambia Jobs Scraper
+# Runs daily at 06:00 UTC, or manually via workflow_dispatch
+# ─────────────────────────────────────────────────────────────────
+name: Scraper
+
+on:
+  schedule:
+    - cron: "0 6 * * *"          # every day at 06:00 UTC (08:00 Lusaka time)
+  workflow_dispatch:              # manual trigger from GitHub Actions UI
+    inputs:
+      max_pages:
+        description: "Pages to crawl per site"
+        required: false
+        default: "5"
+      post_to_wp:
+        description: "Post jobs to WordPress? (true/false)"
+        required: false
+        default: "true"
+      sites:
+        description: "Sites to scrape (space-separated: gozambia zambiajob cvpeople jobsearchzm greatzambia all)"
+        required: false
+        default: "all"
+
+jobs:
+  scrape:
+    name: Scrape Zambia Jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install Python dependencies
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Install Playwright browsers
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 5. Run scraper
+      - name: Run Zambia Jobs Scraper
+        env:
+          WP_URL:  ${{ secrets.ZAMBIA_WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_PASS: ${{ secrets.WP_APP_PASSWORD }}
+        run: |
+          MAX_PAGES="${{ github.event.inputs.max_pages || '5' }}"
+          POST_WP="${{ github.event.inputs.post_to_wp || 'true' }}"
+          SITES="${{ github.event.inputs.sites || 'all' }}"
+
+          CMD="python3 zambia_jobs_scraper_v2.py --max-pages $MAX_PAGES --output zambia_jobs.xlsx"
+
+          # Append --post-wp flag if enabled
+          if [ "$POST_WP" = "true" ]; then
+            CMD="$CMD --post-wp"
+          fi
+
+          # Append site selection if not 'all'
+          if [ "$SITES" != "all" ]; then
+            CMD="$CMD --sites $SITES"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
+
+      # ── 6. Upload Excel as artifact (kept 30 days)
+      - name: Upload Excel results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zambia-jobs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: zambia_jobs.xlsx
+          retention-days: 30
+
+      # ── 7. Commit Excel back to repo (optional — comment out if not needed)
+      - name: Commit results to repo
+        if: github.event_name == 'schedule' || github.event.inputs.post_to_wp == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add zambia_jobs.xlsx
+          git diff --cached --quiet || git commit -m "chore: zambia jobs update $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
