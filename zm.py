@@ -1,29 +1,3 @@
-#!/usr/bin/env python3
-"""
-┌─────────────────────────────────────────────────────────────────┐
-│            ZAMBIA JOBS SCRAPER  v2.0  — MimusJobs               │
-│  Sources: GoZambiaJobs | ZambiaJob | CVPeopleAfrica |           │
-│           JobSearchZM  | GreatZambiaJobs                        │
-│  Output:  zambia_jobs.xlsx  (23 fields)                         │
-│  Mode:    Pure HTML/Playwright — no external AI APIs            │
-└─────────────────────────────────────────────────────────────────┘
-
-USAGE
-─────
-  pip install -r requirements.txt
-  playwright install chromium
-
-  python3 zambia_jobs_scraper_v2.py
-  python3 zambia_jobs_scraper_v2.py --max-pages 10
-  python3 zambia_jobs_scraper_v2.py --post-wp
-
-ENV VARS (for WordPress posting)
-─────────────────────────────────
-  WP_URL   = https://zambia.mimusjobs.com
-  WP_USER  = admin
-  WP_PASS  = your_application_password
-"""
-
 import os, re, time, random, logging, argparse, requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
