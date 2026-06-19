@@ -209,6 +209,150 @@ def sanitize_text(text, is_url: bool = False, is_email: bool = False) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Description cleaning  (removes AI-generated noise from source sites)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Lines / sentences that are pure noise injected by AI-generated source content
+_NOISE_LINE_RE = re.compile(
+    r"""(?:
+        # AI meta-commentary that leaked into descriptions
+        it\s+appears\s+(you|that)\b |
+        could\s+you\s+please\s+(share|provide) |
+        please\s+provide\s+the\s+(full|original|complete)\s+ |
+        i['']d\s+be\s+happy\s+to\s+assist |
+        i\s+(don['']t\s+have|am\s+unable) |
+        since\s+i\s+don['']t\s+have |
+        here['']?s?\s+(a\s+)?professional\s+(version|rewrite|paragraph) |
+        here\s+is\s+the\s+professional\s+paragraph |
+        here['']?s?\s+(the\s+)?(revised|rewritten)\s+(version|paragraph) |
+        rewritten?\s+version\s*: |
+        rephrased\s+version\s*: |
+
+        # Prompt / instruction artifacts
+        output\s+only\s+the\s+rewritten |
+        rewrite\s+this\s+job\s+(description|title) |
+        preserve\s+all\s+(original\s+)?facts |
+        use\s+different\s+(sentence\s+structure|vocabulary|wording) |
+        note\s*:\s+since\s+the\s+original\s+paragraph |
+
+        # Stand-alone label lines (whole line is just a label)
+        ^(paragraph|version|revised|professional\s+version|professional\s+rewriting)\s*:?\s*$ |
+        ^note\s*:?\s*$ |
+
+        # Site-wide subscription / UI boilerplate
+        ^we\s+ensure\s+you\s+remain\s+informed\s+of\s+every\s+new\s+job |
+        ^we\s+encourage\s+you\s+to\s+register\s+for\s+updates |
+        ^we\s+have\s+initiated\s+the\s+development\s+of\s+our\s+corporate |
+        select\s+the\s+subscription\s+option |
+        register\s+for\s+updates\s+and\s+notifications |
+
+        # Single-word UI noise
+        ^follow\s*$ | ^browse\s+by\s*$ | ^date\s+posted\s*$ |
+        ^(today|this\s+week|last\s+week|this\s+month)\s*$ |
+        ^latest\s+jobs\s+posted\s*$ |
+        ^hot\s*$ | ^or\s*$ |
+        ^name\s*\*?\s*$ | ^message\s*\*?\s*$ |
+
+        # Salary filter UI rows
+        ^(100[,.]?000\s+and\s+above|less\s+than\s+20[,.]?000)\s*$ |
+        ^(80[,.]?000\s*[–\-]\s*100[,.]?000)\s*$ |
+
+        # Notes in parentheses that are AI self-notes
+        ^\(note:\s
+    )""",
+    re.I | re.X | re.MULTILINE,
+)
+
+# Boilerplate blocks that should truncate the description at first match
+_BOILERPLATE_CUTOFF_RE = re.compile(
+    r"""(?:
+        we\s+invite\s+you\s+to\s+submit\s+your\s+application\s+for\s+this\s+exciting\s+opportunity |
+        please\s+submit\s+your\s+curr?iculum\s+vitae |
+        the\s+application\s+deadline\s+for\s+submissions |
+        is\s+fire\s+a\s+phenomenon |
+        we\s+are\s+currently\s+seeking\s+a\s+motivated\s+candidate\s+to\s+join\s+our\s+team\s+in\s+a\s+cold |
+        professional\s+career\s+development\s+services\b |
+        these\s+services\s+provide\s+individualized\s+guidance\s+and\s+support\s+to\s+assist\s+professionals |
+        we\s+ensure\s+you\s+remain\s+informed\s+of\s+every\s+new\s+job\s+opportunity |
+        we\s+encourage\s+you\s+to\s+register\s+for\s+updates\s+and\s+notifications |
+        browse\s+by\s*\n+version\s*: |
+        date\s+posted\s*\n+(today|this\s+week) |
+        method\s+for\s+submitting\s+applications\s*:?\s*\n+interested\s+candidates\s+should\s+submit
+    )""",
+    re.I | re.X | re.DOTALL,
+)
+
+# Bracket placeholders: [City, State], [X years], [Job Title], etc.
+_BRACKET_RE = re.compile(r"\[[^\]]{1,80}\]")
+_TINY_BRACKET_LINE_RE = re.compile(r"^\s*\[[^\]]{1,15}\]\s*[.,]?\s*$")
+
+
+def _should_drop_placeholder_line(line: str) -> bool:
+    """Drop a line if bracket placeholders dominate and real words < 3."""
+    if not _BRACKET_RE.search(line):
+        return False
+    # Bare tiny placeholder like "[X]" or "[Job Title]"
+    if _TINY_BRACKET_LINE_RE.match(line):
+        return True
+    bracket_text = " ".join(_BRACKET_RE.findall(line))
+    bracket_words = len(bracket_text.split())
+    total_words   = len(line.split())
+    real_words    = total_words - bracket_words
+    return real_words < 3
+
+
+def clean_description(text: str) -> str:
+    """
+    Strip AI-generated noise, placeholder template lines, and site boilerplate
+    from a scraped job description *before* paraphrasing or posting.
+
+    Preserves all legitimate job content including sentences that happen to
+    contain bracket placeholders alongside real words.
+    """
+    if not text:
+        return ""
+
+    text = fix_mojibake(text)
+
+    # 1. Line-by-line noise removal (runs FIRST so opening noise doesn't trigger cutoff)
+    clean_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        if not stripped:
+            clean_lines.append("")   # preserve paragraph breaks
+            continue
+
+        # Drop noise sentences / labels
+        if _NOISE_LINE_RE.search(stripped):
+            logger.debug("[clean_description] Dropped noise line: %r", stripped[:80])
+            continue
+
+        # Drop lines dominated by bracket placeholders
+        if _should_drop_placeholder_line(stripped):
+            logger.debug("[clean_description] Dropped placeholder line: %r", stripped[:80])
+            continue
+
+        clean_lines.append(line)
+
+    text = "\n".join(clean_lines)
+
+    # 2. NOW apply closing boilerplate cutoff on the already-cleaned text
+    m = _BOILERPLATE_CUTOFF_RE.search(text)
+    if m:
+        text = text[:m.start()].strip()
+
+    # 3. Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # 4. Split into paragraphs, drop any that are too short to be meaningful
+    paras = [p.strip() for p in text.split("\n\n")]
+    paras = [p for p in paras if p and len(p.split()) >= 4]
+
+    return "\n\n".join(paras).strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Date parsing -> ISO (YYYY-MM-DD)
 # ════════════════════════════════════════════════════════════════════════════
 _MONTHS = {m.lower(): i for i, m in enumerate(
@@ -516,14 +660,13 @@ class CompanyEnricher:
 # ════════════════════════════════════════════════════════════════════════════
 _st_model = None
 try:
-    # Suppress tqdm progress bars that sentence-transformers emits per batch
     import os as _os
     _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from sentence_transformers import SentenceTransformer, util as _st_util
     import sentence_transformers.util as _stu          # noqa: F401
     try:
         from tqdm import tqdm as _tqdm
-        _tqdm.__init__.__defaults__  # exists on all tqdm versions
+        _tqdm.__init__.__defaults__
         import functools, tqdm as _tqdm_mod
         _tqdm_mod.tqdm = functools.partial(_tqdm_mod.tqdm, disable=True)
     except Exception:
@@ -583,19 +726,17 @@ class Paraphraser:
     ──────────────
     • If MISTRAL_API_KEY is missing  → passthrough (no API calls at all).
     • If the FIRST live API call returns HTTP 401/403 → permanently disabled
-      for this run; no further calls are ever made (avoids burning hundreds
-      of doomed retries like the original bug).
+      for this run; no further calls are ever made.
     • Verbose per-attempt logging matches the expected output format.
     """
 
     def __init__(self):
         self.api_key = get_secret("MISTRAL_API_KEY")
         self.enabled = bool(self.api_key)
-        self._auth_bad = False          # set True on first 401/403 → stops all calls
+        self._auth_bad = False
         if not self.enabled:
             logger.warning("MISTRAL_API_KEY not set — paraphrasing disabled (passthrough)")
 
-    # ── Low-level call ────────────────────────────────────────────────────────
     def _generate(self, prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
         if not self.enabled or self._auth_bad:
             return ""
@@ -612,7 +753,7 @@ class Paraphraser:
             if r.status_code in (401, 403):
                 logger.error(
                     "Mistral auth failed (%d) — MISTRAL_API_KEY is invalid or expired. "
-                    "Paraphrasing disabled for this run. Fix the secret and re-run.",
+                    "Paraphrasing disabled for this run.",
                     r.status_code,
                 )
                 self._auth_bad = True
@@ -621,12 +762,11 @@ class Paraphraser:
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
         except requests.exceptions.HTTPError:
-            return ""          # already logged above for 401/403; other HTTP errors are rare
+            return ""
         except Exception as e:
             logger.error("Mistral error: %s", e)
             return ""
 
-    # ── Title paraphrase ──────────────────────────────────────────────────────
     def title(self, title: str) -> str:
         clean = sanitize_text(title)
         if not clean or not self.enabled:
@@ -639,7 +779,7 @@ class Paraphraser:
 
         best, best_sim = None, 0.0
         for attempt in range(MAX_ATTEMPTS):
-            if not self.enabled:          # auth failed mid-loop
+            if not self.enabled:
                 break
             temp = round(0.68 + attempt * 0.06, 2)
             prompt = ("Rewrite this job title professionally using different words. "
@@ -681,7 +821,6 @@ class Paraphraser:
         print(f" └{'─'*65}\n")
         return chosen
 
-    # ── Description paraphrase ────────────────────────────────────────────────
     def description(self, text: str) -> str:
         clean = sanitize_text(text)
         if not clean or not self.enabled:
@@ -692,12 +831,11 @@ class Paraphraser:
         out = []
 
         for pi, para in enumerate(paras, 1):
-            if not self.enabled:          # auth died; pass remaining through
+            if not self.enabled:
                 out.append(para)
                 continue
 
             wc_orig = len(para.split())
-            # Skip trivially short paragraphs (headings like "Key Responsibilities")
             if wc_orig < 5:
                 out.append(para)
                 print(f" │ [Para {pi}/{len(paras)}] SKIPPED (too short: {wc_orig} words) → kept as-is")
@@ -705,7 +843,6 @@ class Paraphraser:
 
             print(f"\n │ ┌─ Paragraph {pi}/{len(paras)} {'─'*50}")
             print(f" │ │ ORIGINAL ({wc_orig} words):")
-            # Print wrapped at ~80 chars
             words = para.split()
             line, lines = [], []
             for w in words:
@@ -769,7 +906,6 @@ class Paraphraser:
         print(f" └{'─'*65}\n")
         return "\n\n".join(out)
 
-    # ── Company paraphrase ────────────────────────────────────────────────────
     def company(self, text: str) -> str:
         clean = sanitize_text(text)
         if not clean or not self.enabled:
@@ -1207,7 +1343,6 @@ class BaseScraper:
         raise NotImplementedError
 
     def run(self, max_jobs: int, processed_ids: set, processed_urls: set):
-        # max_jobs == 0  →  unlimited (scrape everything)
         quota_str = str(max_jobs) if max_jobs else "unlimited"
         logger.info(
             "─── [%s] Starting scrape from %s (quota: %s) ───",
@@ -1268,6 +1403,17 @@ class BaseScraper:
             record["Estimated Deadline"] = estimated_deadline(
                 record["Date Posted"], record["Deadline"])
 
+            # ── Clean description of AI noise BEFORE storing / paraphrasing ──
+            raw_desc = record.get("Job Description", "")
+            cleaned_desc = clean_description(raw_desc)
+            if cleaned_desc != raw_desc:
+                dropped = len(raw_desc) - len(cleaned_desc)
+                logger.info(
+                    "[%s] clean_description removed %d chars of noise from '%s'",
+                    self.source_key, dropped, record.get("Job Title", ""),
+                )
+            record["Job Description"] = cleaned_desc
+
             logger.info(
                 "[%s] Record ready — Company='%s' | Location='%s' | Posted='%s' | Deadline='%s'",
                 self.source_key,
@@ -1296,7 +1442,6 @@ class BaseScraper:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 1 — JobwebZambia  (https://jobwebzambia.com)
-#   WordPress/JobRoller; detail pages at /jobs/<slug>/
 # ════════════════════════════════════════════════════════════════════════════
 class JobwebZambia(BaseScraper):
     source_key = "jobwebzambia"
@@ -1321,7 +1466,6 @@ class JobwebZambia(BaseScraper):
                     links.append(href)
             logger.info("[jobwebzambia] %d unique links so far after scanning %s", len(links), url)
 
-        # paginate /jobs/ archive — no page cap; stop only when site has no more
         page = 1
         while True:
             page += 1
@@ -1340,7 +1484,7 @@ class JobwebZambia(BaseScraper):
                     added += 1
             logger.info("[jobwebzambia] Page %d: +%d links (total %d)", page, added, len(links))
             if added == 0:
-                break   # no new links → last page reached
+                break
 
         logger.info("[jobwebzambia] Total job links collected: %d", len(links))
         return links if not max_jobs else links[:max_jobs]
@@ -1351,7 +1495,6 @@ class JobwebZambia(BaseScraper):
         title = _clean_title(h1.get_text() if h1 else _og(soup, "og:title"))
         company_name = _company_from_title(title)
 
-        # try dedicated company meta
         for sel in [".company-name", ".job-company", "span.company", "p.company"]:
             node = soup.select_one(sel)
             if node:
@@ -1370,15 +1513,11 @@ class JobwebZambia(BaseScraper):
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 2 — GoZambiaJobs  (https://gozambiajobs.com)
-#   Custom WordPress theme; job listings at /job/<slug>/ or /jobs/<slug>/
-#   Index page lists cards with class "job_listing" or similar.
-#   RSS available at /feed/?post_type=job_listing
 # ════════════════════════════════════════════════════════════════════════════
 class GoZambiaJobs(BaseScraper):
     source_key = "gozambiajobs"
     base_url = "https://gozambiajobs.com"
 
-    # Patterns that match detail-page URLs on this domain
     _DETAIL_PATTERNS = [
         re.compile(r"https://(?:www\.)?gozambiajobs\.com/job/[a-z0-9\-]+/?$"),
         re.compile(r"https://(?:www\.)?gozambiajobs\.com/jobs/[a-z0-9\-]+/?$"),
@@ -1396,7 +1535,6 @@ class GoZambiaJobs(BaseScraper):
                 seen.add(href)
                 links.append(href)
 
-        # 1) RSS / Atom feed (most reliable)
         for feed_url in [
             f"{self.base_url}/feed/?post_type=job_listing",
             f"{self.base_url}/feed/",
@@ -1408,7 +1546,6 @@ class GoZambiaJobs(BaseScraper):
                     _add(href)
                 logger.info("[gozambiajobs] After feed %s: %d links", feed_url, len(links))
 
-        # 2) Paginated index pages
         page = 0
         while True:
             page += 1
@@ -1429,20 +1566,17 @@ class GoZambiaJobs(BaseScraper):
                 if not html:
                     continue
                 soup = BeautifulSoup(html, "html.parser")
-                # Job cards: WP Job Manager renders <li class="job_listing"> with an <a>
                 for card_sel in ["li.job_listing a", "article.job_listing a",
                                  ".job-listing a", ".job-item a", "h2.job-title a",
                                  "h3.job-title a", "a.job-title"]:
                     for a in soup.select(card_sel):
                         if a.get("href"):
                             _add(urljoin(self.base_url, a["href"]))
-                # Fallback: any anchor matching pattern
                 for a in soup.find_all("a", href=True):
                     _add(urljoin(self.base_url, a["href"]))
 
             logger.info("[gozambiajobs] After page %d scan: %d links", page, len(links))
 
-        # 3) WP REST API fallback
         if len(links) < 5:
             logger.info("[gozambiajobs] Trying WP REST API fallback")
             api_url = f"{self.base_url}/wp-json/wp/v2/job_listing?per_page=50&orderby=date&order=desc"
@@ -1464,7 +1598,6 @@ class GoZambiaJobs(BaseScraper):
     def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
 
-        # ── Title ────────────────────────────────────────────────────────────
         title = ""
         for t_sel in ["h1.job-title", "h1.entry-title", "h1", "h2.job-title"]:
             node = soup.select_one(t_sel)
@@ -1474,7 +1607,6 @@ class GoZambiaJobs(BaseScraper):
         if not title:
             title = _clean_title(_og(soup, "og:title"))
 
-        # ── Company ──────────────────────────────────────────────────────────
         company_name = ""
         for c_sel in [".company-title", ".company-name", "span.company",
                       ".job-company", "a.company", "p.company"]:
@@ -1483,14 +1615,12 @@ class GoZambiaJobs(BaseScraper):
                 company_name = sanitize_text(node.get_text())
                 break
         if not company_name:
-            # WP Job Manager stores employer in meta
             meta_co = soup.find("meta", {"itemprop": "hiringOrganization"})
             if meta_co:
                 company_name = sanitize_text(meta_co.get("content", ""))
         if not company_name:
             company_name = _company_from_title(title)
 
-        # ── Logo ─────────────────────────────────────────────────────────────
         logo = ""
         for logo_sel in [".company-logo img", ".employer-logo img",
                          "img.company-logo", "img.employer-logo"]:
@@ -1501,7 +1631,6 @@ class GoZambiaJobs(BaseScraper):
         if not logo:
             logo = _og(soup, "og:image")
 
-        # ── Location ─────────────────────────────────────────────────────────
         location = ""
         for loc_sel in [".location", ".job-location", "span.location",
                         "[class*='location']", ".meta-location"]:
@@ -1510,7 +1639,6 @@ class GoZambiaJobs(BaseScraper):
                 location = sanitize_text(node.get_text())
                 break
 
-        # ── Job type ─────────────────────────────────────────────────────────
         job_type = ""
         for jt_sel in [".job-type", ".type", "li.job-type", ".employment-type"]:
             node = soup.select_one(jt_sel)
@@ -1518,7 +1646,6 @@ class GoZambiaJobs(BaseScraper):
                 job_type = sanitize_text(node.get_text())
                 break
 
-        # ── Deadline ─────────────────────────────────────────────────────────
         deadline = ""
         for d_sel in [".application-deadline", ".deadline", ".closing-date",
                       "li.date-listed", ".job-expiry"]:
@@ -1526,14 +1653,12 @@ class GoZambiaJobs(BaseScraper):
             if node:
                 deadline = node.get_text(strip=True)
                 break
-        # also check text pattern
         if not deadline:
             m = re.search(r"(?:closing|deadline|apply by)[:\s]+([A-Za-z0-9 ,/\-]+)",
                           soup.get_text("\n", strip=True), re.I)
             if m:
                 deadline = m.group(1).strip()
 
-        # ── JSON-LD (rich data if present) ───────────────────────────────────
         extra: dict = {}
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
@@ -1580,9 +1705,6 @@ class GoZambiaJobs(BaseScraper):
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 3 — JobSearchZM  (https://jobsearchzm.com)
-#   Custom listing site; detail pages at /job/<numeric-id>/<slug>/
-#   or /jobs/<slug>/.  Index at / and /jobs/
-#   The site renders job cards inside <div class="job-box"> or similar.
 # ════════════════════════════════════════════════════════════════════════════
 class JobSearchZM(BaseScraper):
     source_key = "jobsearchzm"
@@ -1599,7 +1721,6 @@ class JobSearchZM(BaseScraper):
         url = url.rstrip("/").split("?")[0]
         if any(p.match(url) for p in self._DETAIL_PATTERNS):
             return True
-        # heuristic: path has 2+ segments and last segment looks like a slug
         path = urlparse(url).path.rstrip("/")
         parts = [p for p in path.split("/") if p]
         if len(parts) >= 2:
@@ -1619,7 +1740,6 @@ class JobSearchZM(BaseScraper):
                     seen.add(href)
                     links.append(href)
 
-        # Index pages + pagination
         page = 0
         while True:
             page += 1
@@ -1642,7 +1762,6 @@ class JobSearchZM(BaseScraper):
                     continue
                 soup = BeautifulSoup(html, "html.parser")
 
-                # Card selectors for common Zambia job board templates
                 for card_sel in [
                     ".job-box a", ".job-card a", ".job-item a",
                     "article.job a", ".listing-item a",
@@ -1653,14 +1772,12 @@ class JobSearchZM(BaseScraper):
                         if a.get("href"):
                             _add(urljoin(self.base_url, a["href"]))
 
-                # Brute-force: all anchors that look like job detail pages
                 for a in soup.find_all("a", href=True):
                     candidate = urljoin(self.base_url, a["href"])
                     _add(candidate)
 
             logger.info("[jobsearchzm] After page %d scan: %d links", page, len(links))
 
-        # WP REST API / sitemap fallback
         if len(links) < 5:
             for api_url in [
                 f"{self.base_url}/wp-json/wp/v2/posts?per_page=50&orderby=date&order=desc",
@@ -1683,7 +1800,6 @@ class JobSearchZM(BaseScraper):
     def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
 
-        # ── Title ────────────────────────────────────────────────────────────
         title = ""
         for t_sel in ["h1.job-title", "h1.entry-title", ".job-title h1",
                       "h1", ".listing-title"]:
@@ -1694,7 +1810,6 @@ class JobSearchZM(BaseScraper):
         if not title:
             title = _clean_title(_og(soup, "og:title"))
 
-        # ── Company ──────────────────────────────────────────────────────────
         company_name = ""
         for c_sel in [".company-name", ".employer-name", ".company",
                       ".job-company", "span.company", ".hiring-company"]:
@@ -1705,7 +1820,6 @@ class JobSearchZM(BaseScraper):
         if not company_name:
             company_name = _company_from_title(title)
 
-        # ── Logo ─────────────────────────────────────────────────────────────
         logo = ""
         for logo_sel in [".company-logo img", ".employer-logo img",
                          "img.company-logo", ".logo img"]:
@@ -1716,9 +1830,7 @@ class JobSearchZM(BaseScraper):
         if not logo:
             logo = _og(soup, "og:image")
 
-        # ── Structured metadata (key-value pairs common on ZM job boards) ────
         meta: dict[str, str] = {}
-        # Try table rows
         for row in soup.select("table tr, .job-meta tr, .details-list li"):
             cells = row.find_all(["td", "th", "dt", "dd", "span"])
             if len(cells) >= 2:
@@ -1726,13 +1838,11 @@ class JobSearchZM(BaseScraper):
                 value = sanitize_text(cells[1].get_text())
                 if key and value:
                     meta[key] = value
-        # Try definition lists
         for dl in soup.select("dl.job-overview, dl.details"):
             dts = dl.find_all("dt")
             dds = dl.find_all("dd")
             for dt, dd in zip(dts, dds):
                 meta[sanitize_text(dt.get_text()).rstrip(":").lower()] = sanitize_text(dd.get_text())
-        # Try labelled spans/divs
         for item in soup.select(".job-info-item, .meta-item, .detail-item"):
             label_node = item.select_one(".label, .key, strong, b")
             value_node = item.select_one(".value, .val, span:last-child")
@@ -1754,7 +1864,6 @@ class JobSearchZM(BaseScraper):
         qual       = _meta("qualification", "education", "minimum qualification", "degree")
         field      = _meta("category", "sector", "department", "job field", "industry")
 
-        # ── JSON-LD ───────────────────────────────────────────────────────────
         extra: dict = {}
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
@@ -1797,7 +1906,6 @@ class JobSearchZM(BaseScraper):
             "Date Posted":        extra.get("Date Posted") or _published(soup),
             "Job Description":    extra.get("Job Description") or _main_content(soup),
         }
-        # Layer in any JSON-LD extras that weren't already set
         for k, v in extra.items():
             if v and not result.get(k):
                 result[k] = v
@@ -1886,9 +1994,9 @@ def main():
     global_stats: dict[str, dict[str, int]] = {}
 
     for source_key in args.sources:
-        cls   = SOURCE_REGISTRY[source_key]
+        cls     = SOURCE_REGISTRY[source_key]
         scraper = cls(http)
-        stats = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
+        stats   = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
         global_stats[source_key] = stats
 
         logger.info("")
@@ -1897,7 +2005,7 @@ def main():
         logger.info("║  URL   : %-28s ║", cls.base_url)
         logger.info("╚══════════════════════════════════════╝")
 
-        for rec in scraper.run(args.limit, processed_ids, processed_urls):  # 0 = unlimited
+        for rec in scraper.run(args.limit, processed_ids, processed_urls):
             jid     = rec.pop("_job_id")
             title   = rec.get("Job Title", "")
             company = rec.get("Company Name", "")
@@ -1936,7 +2044,7 @@ def main():
             logger.info("[%s] Application route: %s", source_key, rec.get("Application", ""))
             _append_csv(rec)
 
-            # ── Paraphrase ───────────────────────────────────────────────
+            # ── Paraphrase ────────────────────────────────────────────────
             if do_paraphrase:
                 logger.info("[%s] Paraphrasing title + description…", source_key)
                 out_title   = para.title(title)
