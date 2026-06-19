@@ -75,29 +75,31 @@ MISTRAL_URL   = "https://api.mistral.ai/v1/chat/completions"
 COUNTRY_KEY      = "zambia"
 COUNTRY_NAME     = "Zambia"
 DEFAULT_LOCATION = "Zambia"
-BASE_URL         = "https://jobwebzambia.com"
-TRACKER_FILE     = "processed_zambia.csv"   # dedupe state, committed back in CI
-OUTPUT_CSV       = "scraped_zambia.csv"      # 22-field rows, committed back in CI
+
+# ── Multi-source tracker / output files ───────────────────────────────────────
+TRACKER_FILE = "processed_zambia.csv"
+OUTPUT_CSV   = "scraped_zambia.csv"
+
+# ── Source registry (all scrapers wired here) ─────────────────────────────────
+#   key  -> used in --sources CLI arg and tracker "Source" column
+SOURCE_REGISTRY: dict[str, type] = {}   # filled after class definitions
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Secrets — read ONLY from the environment. Nothing sensitive is ever hardcoded
-# in this file. In GitHub Actions these come from repository secrets; locally,
-# export them before running. Required: MISTRAL_API_KEY, WP_BASE_URL,
-# WP_USERNAME, WP_APP_PASSWORD.  Optional: WP_VERIFY_SSL.
+# Secrets
 # ════════════════════════════════════════════════════════════════════════════
 def get_secret(name: str, default: str | None = None, required: bool = False) -> str:
     val = os.environ.get(name, default)
     if required and not val:
         raise RuntimeError(
             f"Missing required secret: {name}. "
-            f"Add it under Settings -> Secrets -> Actions (or export it locally)."
+            "Add it under Settings -> Secrets -> Actions (or export it locally)."
         )
     return val or ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Polite HTTP client (retries, real UA, per-host throttle, robots-aware)
+# Polite HTTP client
 # ════════════════════════════════════════════════════════════════════════════
 class HttpClient:
     def __init__(self):
@@ -127,16 +129,13 @@ class HttpClient:
         if host not in self._robots:
             rp = None
             try:
-                # Fetch ourselves so we control status handling. Many job boards
-                # sit behind Cloudflare and 403 the robots fetch — that must NOT
-                # be read as "disallow everything".
                 resp = self.session.get(f"{host}/robots.txt", timeout=10)
                 if resp.status_code == 200 and resp.text.strip():
                     rp = RobotFileParser()
                     rp.parse(resp.text.splitlines())
             except Exception:
                 rp = None
-            self._robots[host] = rp  # None => treat as allow
+            self._robots[host] = rp
         rp = self._robots[host]
         if rp is None:
             return True
@@ -150,6 +149,7 @@ class HttpClient:
         last = self._last_hit.get(host, 0.0)
         wait = REQUEST_DELAY_SECONDS - (time.time() - last)
         if wait > 0:
+            logger.debug("Throttling %.1fs for %s", wait, host)
             time.sleep(wait)
         self._last_hit[host] = time.time()
 
@@ -162,6 +162,7 @@ class HttpClient:
             r = self.session.get(url, timeout=timeout or REQUEST_TIMEOUT)
             r.raise_for_status()
             r.encoding = r.apparent_encoding or "utf-8"
+            logger.debug("GET %s  [%d]", url, r.status_code)
             return r
         except Exception as e:
             logger.warning("GET failed %s — %s", url, e)
@@ -224,7 +225,6 @@ def parse_date(raw: str, fallback_today: bool = False) -> str:
     raw = re.sub(r"(?i)\b(posted|apply by|closing date|deadline|on)\b[:\s]*", "", raw).strip()
     raw = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw, flags=re.I)
 
-    # numeric and month-abbrev slash/dash forms, incl. 18/Jun/2026
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y",
                 "%d/%b/%Y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"):
         try:
@@ -232,7 +232,6 @@ def parse_date(raw: str, fallback_today: bool = False) -> str:
         except ValueError:
             pass
 
-    # textual: "25 June 2026" / "June 25, 2026" / "25 June"
     m = re.search(r"(\d{1,2})\s+([A-Za-z]+)\s*(\d{4})?", raw)
     if m and m.group(2).lower()[:3] in _MONTHS:
         d, mon, y = int(m.group(1)), _MONTHS[m.group(2).lower()[:3]], m.group(3)
@@ -309,8 +308,6 @@ def _visible_text(soup: BeautifulSoup) -> str:
 
 
 def extract_application(html: str, page_url: str) -> str:
-    """Best application route: external apply URL, mailto, or an email near a
-    'how to apply' cue. Empty string if nothing usable is found."""
     soup = BeautifulSoup(html, "html.parser")
     site_domain = domain_of(page_url)
     text = _visible_text(soup)
@@ -367,9 +364,6 @@ _FOUNDED_RE = re.compile(
 
 
 class CompanyEnricher:
-    """Fills blank company fields (and a missing application route) by visiting
-    the employer's own website. Best-effort and time-bounded."""
-
     def __init__(self, http: HttpClient):
         self.http = http
         self._cache: dict[str, dict] = {}
@@ -518,7 +512,7 @@ class CompanyEnricher:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Mistral paraphraser (optional NLP extras degrade gracefully)
+# Mistral paraphraser
 # ════════════════════════════════════════════════════════════════════════════
 _st_model = None
 try:
@@ -657,8 +651,7 @@ class Paraphraser:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WordPress client (WP Job Manager style) — same endpoints/meta keys as your
-# existing pipeline.  SSL verify defaults ON (WP_VERIFY_SSL=false to disable).
+# WordPress client
 # ════════════════════════════════════════════════════════════════════════════
 class WordPressClient:
     def __init__(self):
@@ -773,8 +766,8 @@ class WordPressClient:
         deadline = sanitize_text(rec.get("Deadline", "")) or sanitize_text(rec.get("Estimated Deadline", ""))
 
         is_email = bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", application))
-        is_url = bool(re.match(r"^https?://\S+$", application))
-        if not (is_email or is_url):
+        is_url_val = bool(re.match(r"^https?://\S+$", application))
+        if not (is_email or is_url_val):
             application = ""
 
         slug = self._slug(title)
@@ -836,7 +829,7 @@ class WordPressClient:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Dedupe + status tracker (per-country CSV; committed back in CI)
+# Dedupe + status tracker
 # ════════════════════════════════════════════════════════════════════════════
 _TRACKER_COLUMNS = ["Job ID", "Source", "Job URL", "Job Title", "Company Name",
                     "Status", "Timestamp"]
@@ -960,7 +953,7 @@ _JOB_HINT = re.compile(r"(job|vacanc|position|recruit|career|apply|hiring|openin
 
 def _clean_title(raw: str) -> str:
     raw = sanitize_text(raw)
-    raw = re.split(r"\s+[|\u2013-]\s+(?:MyJobMag|Jobweb|Jobs4BW|NaJobs|Go Zambia)", raw)[0]
+    raw = re.split(r"\s+[|\u2013-]\s+(?:MyJobMag|Jobweb|Jobs4BW|NaJobs|Go Zambia|GoZambia|JobSearch)", raw)[0]
     raw = re.sub(r"\s*[-\u2013]\s*Apply by .*$", "", raw, flags=re.I)
     return raw.strip()
 
@@ -977,7 +970,8 @@ def _main_content(soup: BeautifulSoup) -> str:
     candidates = []
     for sel in ["div.entry-content", "div.job_description", "div.job-description",
                 "article", "div.single-job", "main", "div#content", "div.post-content",
-                "div.td-post-content"]:
+                "div.td-post-content", "div.job-detail", "div.job-details",
+                "div.description", "div.content-area", "section.job-details"]:
         for node in soup.select(sel):
             txt = node.get_text("\n", strip=True)
             if len(txt) > 120:
@@ -1058,12 +1052,11 @@ def _paginate(http, index_urls, base, max_links, page_cap=4) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Base scraper (run loop). Country adapter below supplies iter_job_links +
-# parse_detail.
+# Base scraper
 # ════════════════════════════════════════════════════════════════════════════
 class BaseScraper:
-    source_key = COUNTRY_KEY
-    base_url = BASE_URL
+    source_key: str = "unknown"
+    base_url: str = ""
 
     def __init__(self, http: HttpClient):
         self.http = http
@@ -1077,27 +1070,38 @@ class BaseScraper:
         raise NotImplementedError
 
     def run(self, max_jobs: int, processed_ids: set, processed_urls: set):
+        logger.info(
+            "─── [%s] Starting scrape from %s (quota: %d) ───",
+            self.source_key.upper(), self.base_url, max_jobs,
+        )
         yielded = 0
         for url in self.iter_job_links(max_jobs * 2):
             if yielded >= max_jobs:
                 break
             url = sanitize_text(url, is_url=True)
             if not url or url in processed_urls:
+                logger.debug("[%s] Skipping already-seen URL: %s", self.source_key, url)
                 continue
             jid = make_job_id(url)
             if jid in processed_ids:
+                logger.debug("[%s] Skipping already-processed ID %s", self.source_key, jid)
                 continue
 
+            logger.info("[%s] Fetching job detail: %s", self.source_key, url)
             html = self.http.get_text(url)
             if not html:
+                logger.warning("[%s] Empty response for %s", self.source_key, url)
                 continue
             try:
                 rec = self.parse_detail(html, url)
             except Exception as e:
-                logger.warning("parse_detail failed for %s: %s", url, e)
+                logger.warning("[%s] parse_detail failed for %s: %s", self.source_key, url, e)
                 continue
             if not rec or not sanitize_text(rec.get("Job Title", "")):
+                logger.warning("[%s] No title extracted from %s — skipping", self.source_key, url)
                 continue
+
+            logger.info("[%s] Extracted title: '%s'", self.source_key, rec.get("Job Title", ""))
 
             record = empty_record()
             record.update({k: v for k, v in rec.items() if v})
@@ -1108,9 +1112,12 @@ class BaseScraper:
             for k, v in mined.items():
                 if not sanitize_text(record.get(k, "")):
                     record[k] = v
+                    logger.debug("[%s] Mined field %s = %s", self.source_key, k, v[:60])
 
             if not sanitize_text(record.get("Application", "")):
                 record["Application"] = extract_application(html, url)
+                if record["Application"]:
+                    logger.info("[%s] Application route found: %s", self.source_key, record["Application"])
 
             if not record.get("Company Name"):
                 record["Company Name"] = self._guess_company(record, soup)
@@ -1122,11 +1129,22 @@ class BaseScraper:
             record["Estimated Deadline"] = estimated_deadline(
                 record["Date Posted"], record["Deadline"])
 
+            logger.info(
+                "[%s] Record ready — Company='%s' | Location='%s' | Posted='%s' | Deadline='%s'",
+                self.source_key,
+                record.get("Company Name", ""),
+                record.get("Job Location", ""),
+                record.get("Date Posted", ""),
+                record.get("Estimated Deadline", ""),
+            )
+
             record["_job_id"] = jid
             processed_ids.add(jid)
             processed_urls.add(url)
             yielded += 1
             yield record
+
+        logger.info("[%s] Scrape complete — yielded %d record(s)", self.source_key.upper(), yielded)
 
     def _guess_company(self, record: dict, soup: BeautifulSoup) -> str:
         title = record.get("Job Title", "")
@@ -1138,40 +1156,523 @@ class BaseScraper:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Zambia — JobwebZambia (WordPress/JobRoller, detail = /jobs/<slug>/)
+# SOURCE 1 — JobwebZambia  (https://jobwebzambia.com)
+#   WordPress/JobRoller; detail pages at /jobs/<slug>/
 # ════════════════════════════════════════════════════════════════════════════
 class JobwebZambia(BaseScraper):
-    source_key = "zambia"
+    source_key = "jobwebzambia"
     base_url = "https://jobwebzambia.com"
 
     def iter_job_links(self, max_jobs):
-        index = [f"{self.base_url}/", f"{self.base_url}/feed/?post_type=job_listing"]
-        links = []
+        logger.info("[jobwebzambia] Collecting job links from index + RSS feed")
+        index = [
+            f"{self.base_url}/",
+            f"{self.base_url}/feed/?post_type=job_listing",
+        ]
+        links: list[str] = []
         for url in index:
             html = self.http.get_text(url)
             if not html:
+                logger.warning("[jobwebzambia] No response from index %s", url)
                 continue
-            for href in re.findall(r"https://jobwebzambia\.com/jobs/[a-z0-9\-]+/?", html):
+            found = re.findall(r"https://jobwebzambia\.com/jobs/[a-z0-9\-]+/?", html)
+            for href in found:
                 href = href.rstrip("/")
                 if href not in links:
                     links.append(href)
+            logger.info("[jobwebzambia] %d unique links so far after scanning %s", len(links), url)
+
+        # paginate /jobs/ archive as well
+        page = 1
+        while len(links) < max_jobs and page <= 5:
+            page += 1
+            purl = f"{self.base_url}/jobs/page/{page}/"
+            html = self.http.get_text(purl)
+            if not html:
+                break
+            found = re.findall(r"https://jobwebzambia\.com/jobs/[a-z0-9\-]+/?", html)
+            added = 0
+            for href in found:
+                href = href.rstrip("/")
+                if href not in links:
+                    links.append(href)
+                    added += 1
+            logger.info("[jobwebzambia] Page %d: +%d links (total %d)", page, added, len(links))
+            if added == 0:
+                break
+
+        logger.info("[jobwebzambia] Total job links collected: %d", len(links))
         return links[:max_jobs]
 
     def parse_detail(self, html, url):
         soup = BeautifulSoup(html, "html.parser")
         h1 = soup.find("h1")
         title = _clean_title(h1.get_text() if h1 else _og(soup, "og:title"))
-        return {"Job Title": title, "Company Name": _company_from_title(title),
-                "Company Logo": _og(soup, "og:image"),
-                "Job Description": _main_content(soup),
-                "Date Posted": _published(soup)}
+        company_name = _company_from_title(title)
 
+        # try dedicated company meta
+        for sel in [".company-name", ".job-company", "span.company", "p.company"]:
+            node = soup.select_one(sel)
+            if node:
+                company_name = sanitize_text(node.get_text())
+                break
 
-SCRAPER_CLASS = JobwebZambia
+        logger.debug("[jobwebzambia] title=%r  company=%r", title, company_name)
+        return {
+            "Job Title":       title,
+            "Company Name":    company_name,
+            "Company Logo":    _og(soup, "og:image"),
+            "Job Description": _main_content(soup),
+            "Date Posted":     _published(soup),
+        }
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Orchestration
+# SOURCE 2 — GoZambiaJobs  (https://gozambiajobs.com)
+#   Custom WordPress theme; job listings at /job/<slug>/ or /jobs/<slug>/
+#   Index page lists cards with class "job_listing" or similar.
+#   RSS available at /feed/?post_type=job_listing
+# ════════════════════════════════════════════════════════════════════════════
+class GoZambiaJobs(BaseScraper):
+    source_key = "gozambiajobs"
+    base_url = "https://gozambiajobs.com"
+
+    # Patterns that match detail-page URLs on this domain
+    _DETAIL_PATTERNS = [
+        re.compile(r"https://(?:www\.)?gozambiajobs\.com/job/[a-z0-9\-]+/?$"),
+        re.compile(r"https://(?:www\.)?gozambiajobs\.com/jobs/[a-z0-9\-]+/?$"),
+        re.compile(r"https://(?:www\.)?gozambiajobs\.com/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/?$"),
+    ]
+
+    def iter_job_links(self, max_jobs):
+        logger.info("[gozambiajobs] Collecting job links")
+        links: list[str] = []
+        seen: set[str] = set()
+
+        def _add(href: str):
+            href = href.rstrip("/").split("?")[0].split("#")[0]
+            if href not in seen and any(p.match(href) for p in self._DETAIL_PATTERNS):
+                seen.add(href)
+                links.append(href)
+
+        # 1) RSS / Atom feed (most reliable)
+        for feed_url in [
+            f"{self.base_url}/feed/?post_type=job_listing",
+            f"{self.base_url}/feed/",
+        ]:
+            logger.info("[gozambiajobs] Trying feed: %s", feed_url)
+            html = self.http.get_text(feed_url)
+            if html:
+                for href in re.findall(r"https://(?:www\.)?gozambiajobs\.com/[^\s\"<>]+", html):
+                    _add(href)
+                logger.info("[gozambiajobs] After feed %s: %d links", feed_url, len(links))
+
+        # 2) Paginated index pages
+        for page in range(1, 6):
+            if len(links) >= max_jobs:
+                break
+            candidates = [
+                f"{self.base_url}/jobs/page/{page}/",
+                f"{self.base_url}/?paged={page}",
+                f"{self.base_url}/job-listings/page/{page}/",
+            ] if page > 1 else [
+                f"{self.base_url}/",
+                f"{self.base_url}/jobs/",
+                f"{self.base_url}/job-listings/",
+            ]
+            for idx_url in candidates:
+                logger.info("[gozambiajobs] Scanning index: %s", idx_url)
+                html = self.http.get_text(idx_url)
+                if not html:
+                    continue
+                soup = BeautifulSoup(html, "html.parser")
+                # Job cards: WP Job Manager renders <li class="job_listing"> with an <a>
+                for card_sel in ["li.job_listing a", "article.job_listing a",
+                                 ".job-listing a", ".job-item a", "h2.job-title a",
+                                 "h3.job-title a", "a.job-title"]:
+                    for a in soup.select(card_sel):
+                        if a.get("href"):
+                            _add(urljoin(self.base_url, a["href"]))
+                # Fallback: any anchor matching pattern
+                for a in soup.find_all("a", href=True):
+                    _add(urljoin(self.base_url, a["href"]))
+
+            logger.info("[gozambiajobs] After page %d scan: %d links", page, len(links))
+
+        # 3) WP REST API fallback
+        if len(links) < 5:
+            logger.info("[gozambiajobs] Trying WP REST API fallback")
+            api_url = f"{self.base_url}/wp-json/wp/v2/job_listing?per_page=50&orderby=date&order=desc"
+            resp = self.http.get(api_url)
+            if resp and resp.status_code == 200:
+                try:
+                    items = resp.json()
+                    for item in items:
+                        lnk = item.get("link") or item.get("guid", {}).get("rendered", "")
+                        if lnk:
+                            _add(lnk)
+                    logger.info("[gozambiajobs] REST API returned %d posts", len(items))
+                except Exception as e:
+                    logger.warning("[gozambiajobs] REST API parse error: %s", e)
+
+        logger.info("[gozambiajobs] Total job links collected: %d", len(links))
+        return links[:max_jobs]
+
+    def parse_detail(self, html: str, url: str) -> dict:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ── Title ────────────────────────────────────────────────────────────
+        title = ""
+        for t_sel in ["h1.job-title", "h1.entry-title", "h1", "h2.job-title"]:
+            node = soup.select_one(t_sel)
+            if node:
+                title = _clean_title(node.get_text())
+                break
+        if not title:
+            title = _clean_title(_og(soup, "og:title"))
+
+        # ── Company ──────────────────────────────────────────────────────────
+        company_name = ""
+        for c_sel in [".company-title", ".company-name", "span.company",
+                      ".job-company", "a.company", "p.company"]:
+            node = soup.select_one(c_sel)
+            if node:
+                company_name = sanitize_text(node.get_text())
+                break
+        if not company_name:
+            # WP Job Manager stores employer in meta
+            meta_co = soup.find("meta", {"itemprop": "hiringOrganization"})
+            if meta_co:
+                company_name = sanitize_text(meta_co.get("content", ""))
+        if not company_name:
+            company_name = _company_from_title(title)
+
+        # ── Logo ─────────────────────────────────────────────────────────────
+        logo = ""
+        for logo_sel in [".company-logo img", ".employer-logo img",
+                         "img.company-logo", "img.employer-logo"]:
+            node = soup.select_one(logo_sel)
+            if node and node.get("src"):
+                logo = urljoin(url, node["src"])
+                break
+        if not logo:
+            logo = _og(soup, "og:image")
+
+        # ── Location ─────────────────────────────────────────────────────────
+        location = ""
+        for loc_sel in [".location", ".job-location", "span.location",
+                        "[class*='location']", ".meta-location"]:
+            node = soup.select_one(loc_sel)
+            if node:
+                location = sanitize_text(node.get_text())
+                break
+
+        # ── Job type ─────────────────────────────────────────────────────────
+        job_type = ""
+        for jt_sel in [".job-type", ".type", "li.job-type", ".employment-type"]:
+            node = soup.select_one(jt_sel)
+            if node:
+                job_type = sanitize_text(node.get_text())
+                break
+
+        # ── Deadline ─────────────────────────────────────────────────────────
+        deadline = ""
+        for d_sel in [".application-deadline", ".deadline", ".closing-date",
+                      "li.date-listed", ".job-expiry"]:
+            node = soup.select_one(d_sel)
+            if node:
+                deadline = node.get_text(strip=True)
+                break
+        # also check text pattern
+        if not deadline:
+            m = re.search(r"(?:closing|deadline|apply by)[:\s]+([A-Za-z0-9 ,/\-]+)",
+                          soup.get_text("\n", strip=True), re.I)
+            if m:
+                deadline = m.group(1).strip()
+
+        # ── JSON-LD (rich data if present) ───────────────────────────────────
+        extra: dict = {}
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(tag.string or "{}")
+            except Exception:
+                continue
+            for node in (data if isinstance(data, list) else [data]):
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("@type", "")).lower() in ("jobposting",):
+                    extra["Job Title"]        = extra.get("Job Title") or sanitize_text(node.get("title", ""))
+                    extra["Date Posted"]      = extra.get("Date Posted") or node.get("datePosted", "")[:10]
+                    extra["Deadline"]         = extra.get("Deadline") or node.get("validThrough", "")[:10]
+                    extra["Job Location"]     = extra.get("Job Location") or sanitize_text(
+                        (node.get("jobLocation") or {}).get("address", {}).get("addressLocality", ""))
+                    extra["Salary Range"]     = extra.get("Salary Range") or sanitize_text(
+                        str(node.get("baseSalary", {}).get("value", "") or ""))
+                    extra["Job Type"]         = extra.get("Job Type") or sanitize_text(
+                        node.get("employmentType", ""))
+                    extra["Job Description"]  = extra.get("Job Description") or sanitize_text(
+                        node.get("description", ""))
+                    horg = node.get("hiringOrganization") or {}
+                    if not company_name and horg.get("name"):
+                        company_name = sanitize_text(horg["name"])
+                    if not logo and horg.get("logo"):
+                        logo = sanitize_text(horg["logo"], is_url=True)
+
+        logger.debug("[gozambiajobs] title=%r  company=%r  location=%r  type=%r",
+                     title, company_name, location, job_type)
+
+        result = {
+            "Job Title":       title,
+            "Company Name":    company_name,
+            "Company Logo":    logo,
+            "Job Location":    location or DEFAULT_LOCATION,
+            "Job Type":        job_type,
+            "Deadline":        deadline,
+            "Date Posted":     extra.get("Date Posted") or _published(soup),
+            "Job Description": extra.get("Job Description") or _main_content(soup),
+        }
+        result.update({k: v for k, v in extra.items() if v and not result.get(k)})
+        return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SOURCE 3 — JobSearchZM  (https://jobsearchzm.com)
+#   Custom listing site; detail pages at /job/<numeric-id>/<slug>/
+#   or /jobs/<slug>/.  Index at / and /jobs/
+#   The site renders job cards inside <div class="job-box"> or similar.
+# ════════════════════════════════════════════════════════════════════════════
+class JobSearchZM(BaseScraper):
+    source_key = "jobsearchzm"
+    base_url = "https://jobsearchzm.com"
+
+    _DETAIL_PATTERNS = [
+        re.compile(r"https://(?:www\.)?jobsearchzm\.com/job/\d+/[a-z0-9\-]+/?$"),
+        re.compile(r"https://(?:www\.)?jobsearchzm\.com/jobs?/[a-z0-9\-]+/?$"),
+        re.compile(r"https://(?:www\.)?jobsearchzm\.com/vacancies?/[a-z0-9\-]+/?$"),
+        re.compile(r"https://(?:www\.)?jobsearchzm\.com/\d+/[a-z0-9\-]+/?$"),
+    ]
+
+    def _is_detail(self, url: str) -> bool:
+        url = url.rstrip("/").split("?")[0]
+        if any(p.match(url) for p in self._DETAIL_PATTERNS):
+            return True
+        # heuristic: path has 2+ segments and last segment looks like a slug
+        path = urlparse(url).path.rstrip("/")
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            last = parts[-1]
+            return ("-" in last and len(last) > 10) or _JOB_HINT.search(last) is not None
+        return False
+
+    def iter_job_links(self, max_jobs):
+        logger.info("[jobsearchzm] Collecting job links")
+        links: list[str] = []
+        seen: set[str] = set()
+
+        def _add(href: str):
+            href = href.rstrip("/").split("?")[0].split("#")[0]
+            if href and href not in seen and domain_of(href) in ("jobsearchzm.com", "www.jobsearchzm.com"):
+                if self._is_detail(href):
+                    seen.add(href)
+                    links.append(href)
+
+        # Index pages + pagination
+        for page in range(1, 7):
+            if len(links) >= max_jobs:
+                break
+            base_candidates = [
+                f"{self.base_url}/",
+                f"{self.base_url}/jobs/",
+                f"{self.base_url}/vacancies/",
+            ] if page == 1 else [
+                f"{self.base_url}/jobs/page/{page}/",
+                f"{self.base_url}/jobs/?page={page}",
+                f"{self.base_url}/?paged={page}",
+                f"{self.base_url}/?page={page}",
+            ]
+            for idx_url in base_candidates:
+                logger.info("[jobsearchzm] Scanning index page: %s", idx_url)
+                html = self.http.get_text(idx_url)
+                if not html:
+                    continue
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Card selectors for common Zambia job board templates
+                for card_sel in [
+                    ".job-box a", ".job-card a", ".job-item a",
+                    "article.job a", ".listing-item a",
+                    "h2 a", "h3 a", ".job_listing a",
+                    "a.job-link", "a.listing-title",
+                ]:
+                    for a in soup.select(card_sel):
+                        if a.get("href"):
+                            _add(urljoin(self.base_url, a["href"]))
+
+                # Brute-force: all anchors that look like job detail pages
+                for a in soup.find_all("a", href=True):
+                    candidate = urljoin(self.base_url, a["href"])
+                    _add(candidate)
+
+            logger.info("[jobsearchzm] After page %d scan: %d links", page, len(links))
+
+        # WP REST API / sitemap fallback
+        if len(links) < 5:
+            for api_url in [
+                f"{self.base_url}/wp-json/wp/v2/posts?per_page=50&orderby=date&order=desc",
+                f"{self.base_url}/wp-json/wp/v2/job_listing?per_page=50&orderby=date&order=desc",
+            ]:
+                logger.info("[jobsearchzm] Trying REST API: %s", api_url)
+                resp = self.http.get(api_url)
+                if resp and resp.status_code == 200:
+                    try:
+                        for item in resp.json():
+                            lnk = item.get("link") or ""
+                            if lnk:
+                                _add(lnk)
+                    except Exception as e:
+                        logger.warning("[jobsearchzm] REST API error: %s", e)
+
+        logger.info("[jobsearchzm] Total job links collected: %d", len(links))
+        return links[:max_jobs]
+
+    def parse_detail(self, html: str, url: str) -> dict:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # ── Title ────────────────────────────────────────────────────────────
+        title = ""
+        for t_sel in ["h1.job-title", "h1.entry-title", ".job-title h1",
+                      "h1", ".listing-title"]:
+            node = soup.select_one(t_sel)
+            if node:
+                title = _clean_title(node.get_text())
+                break
+        if not title:
+            title = _clean_title(_og(soup, "og:title"))
+
+        # ── Company ──────────────────────────────────────────────────────────
+        company_name = ""
+        for c_sel in [".company-name", ".employer-name", ".company",
+                      ".job-company", "span.company", ".hiring-company"]:
+            node = soup.select_one(c_sel)
+            if node:
+                company_name = sanitize_text(node.get_text())
+                break
+        if not company_name:
+            company_name = _company_from_title(title)
+
+        # ── Logo ─────────────────────────────────────────────────────────────
+        logo = ""
+        for logo_sel in [".company-logo img", ".employer-logo img",
+                         "img.company-logo", ".logo img"]:
+            node = soup.select_one(logo_sel)
+            if node and node.get("src"):
+                logo = urljoin(url, node["src"])
+                break
+        if not logo:
+            logo = _og(soup, "og:image")
+
+        # ── Structured metadata (key-value pairs common on ZM job boards) ────
+        meta: dict[str, str] = {}
+        # Try table rows
+        for row in soup.select("table tr, .job-meta tr, .details-list li"):
+            cells = row.find_all(["td", "th", "dt", "dd", "span"])
+            if len(cells) >= 2:
+                key   = sanitize_text(cells[0].get_text()).rstrip(":").lower()
+                value = sanitize_text(cells[1].get_text())
+                if key and value:
+                    meta[key] = value
+        # Try definition lists
+        for dl in soup.select("dl.job-overview, dl.details"):
+            dts = dl.find_all("dt")
+            dds = dl.find_all("dd")
+            for dt, dd in zip(dts, dds):
+                meta[sanitize_text(dt.get_text()).rstrip(":").lower()] = sanitize_text(dd.get_text())
+        # Try labelled spans/divs
+        for item in soup.select(".job-info-item, .meta-item, .detail-item"):
+            label_node = item.select_one(".label, .key, strong, b")
+            value_node = item.select_one(".value, .val, span:last-child")
+            if label_node and value_node:
+                meta[sanitize_text(label_node.get_text()).rstrip(":").lower()] = \
+                    sanitize_text(value_node.get_text())
+
+        def _meta(*keys):
+            for k in keys:
+                if k in meta:
+                    return meta[k]
+            return ""
+
+        location   = _meta("location", "job location", "city", "town", "region")
+        job_type   = _meta("job type", "employment type", "contract type", "type")
+        deadline   = _meta("deadline", "closing date", "apply by", "close date", "expiry")
+        salary     = _meta("salary", "remuneration", "pay", "wage", "compensation")
+        experience = _meta("experience", "years of experience", "experience required")
+        qual       = _meta("qualification", "education", "minimum qualification", "degree")
+        field      = _meta("category", "sector", "department", "job field", "industry")
+
+        # ── JSON-LD ───────────────────────────────────────────────────────────
+        extra: dict = {}
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(tag.string or "{}")
+            except Exception:
+                continue
+            for node in (data if isinstance(data, list) else [data]):
+                if not isinstance(node, dict):
+                    continue
+                if str(node.get("@type", "")).lower() == "jobposting":
+                    extra["Date Posted"]  = node.get("datePosted", "")[:10]
+                    extra["Deadline"]     = node.get("validThrough", "")[:10]
+                    jl = node.get("jobLocation") or {}
+                    if isinstance(jl, dict):
+                        addr = jl.get("address") or {}
+                        extra["Job Location"] = sanitize_text(
+                            addr.get("addressLocality", "") or addr.get("addressRegion", ""))
+                    extra["Job Type"]     = sanitize_text(node.get("employmentType", ""))
+                    extra["Job Description"] = sanitize_text(node.get("description", ""))
+                    horg = node.get("hiringOrganization") or {}
+                    if not company_name and horg.get("name"):
+                        company_name = sanitize_text(horg["name"])
+                    if not logo and horg.get("logo"):
+                        logo = sanitize_text(horg["logo"], is_url=True)
+
+        logger.debug("[jobsearchzm] title=%r  company=%r  location=%r  type=%r  deadline=%r",
+                     title, company_name, location, job_type, deadline)
+
+        result = {
+            "Job Title":          title,
+            "Company Name":       company_name,
+            "Company Logo":       logo,
+            "Job Location":       location or DEFAULT_LOCATION,
+            "Job Type":           job_type,
+            "Deadline":           deadline,
+            "Salary Range":       salary,
+            "Job Experience":     experience,
+            "Job Qualifications": qual,
+            "Job Field":          field,
+            "Date Posted":        extra.get("Date Posted") or _published(soup),
+            "Job Description":    extra.get("Job Description") or _main_content(soup),
+        }
+        # Layer in any JSON-LD extras that weren't already set
+        for k, v in extra.items():
+            if v and not result.get(k):
+                result[k] = v
+        return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Source registry
+# ════════════════════════════════════════════════════════════════════════════
+SOURCE_REGISTRY = {
+    "jobwebzambia":  JobwebZambia,
+    "gozambiajobs":  GoZambiaJobs,
+    "jobsearchzm":   JobSearchZM,
+}
+
+_ALL_SOURCES = list(SOURCE_REGISTRY.keys())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Orchestration helpers
 # ════════════════════════════════════════════════════════════════════════════
 def _needs_enrichment(rec: dict) -> bool:
     if not has_application(rec):
@@ -1189,81 +1690,173 @@ def _append_csv(rec: dict):
         w.writerow({c: rec.get(c, "") for c in APPSCRIPT_COLUMNS})
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# main()
+# ════════════════════════════════════════════════════════════════════════════
 def main():
     ap = argparse.ArgumentParser(
-        description=f"{COUNTRY_NAME} job scraper ({SCRAPER_CLASS.base_url}) -> WordPress")
-    ap.add_argument("--limit", type=int, default=10, help="max jobs this run")
-    ap.add_argument("--dry-run", action="store_true", help="scrape+paraphrase but do not post")
-    ap.add_argument("--no-paraphrase", action="store_true", help="post original text")
+        description="Multi-source Zambia job scraper → WordPress",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Available sources: {', '.join(_ALL_SOURCES)}",
+    )
+    ap.add_argument("--limit",        type=int, default=10,
+                    help="max jobs per source this run (default: 10)")
+    ap.add_argument("--sources",      nargs="+", default=_ALL_SOURCES,
+                    choices=_ALL_SOURCES, metavar="SOURCE",
+                    help=f"which sources to run (default: all). choices: {_ALL_SOURCES}")
+    ap.add_argument("--dry-run",      action="store_true",
+                    help="scrape + paraphrase but do NOT post to WordPress")
+    ap.add_argument("--no-paraphrase", action="store_true",
+                    help="post original text without Mistral paraphrasing")
+    ap.add_argument("--verbose",       action="store_true",
+                    help="enable DEBUG-level logging")
     args = ap.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+
     do_paraphrase = not args.no_paraphrase
 
-    http = HttpClient()
+    logger.info("=" * 60)
+    logger.info("Zambia Multi-Source Job Scraper")
+    logger.info("Sources  : %s", ", ".join(args.sources))
+    logger.info("Limit    : %d jobs/source", args.limit)
+    logger.info("Dry-run  : %s", args.dry_run)
+    logger.info("Paraphrase: %s", do_paraphrase)
+    logger.info("=" * 60)
+
+    http     = HttpClient()
     enricher = CompanyEnricher(http)
-    para = Paraphraser()
+    para     = Paraphraser()
 
     wp = None
     if not args.dry_run:
         wp = WordPressClient()
 
     processed_ids, processed_urls = tracker_load()
-    scraper = SCRAPER_CLASS(http)
-    stats = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
-    logger.info("=== %s via %s (limit %d) ===",
-                COUNTRY_NAME, SCRAPER_CLASS.__name__, args.limit)
+    logger.info("Tracker: %d previously processed IDs / %d URLs loaded",
+                len(processed_ids), len(processed_urls))
 
-    for rec in scraper.run(args.limit, processed_ids, processed_urls):
-        jid = rec.pop("_job_id")
-        title = rec.get("Job Title", "")
-        company = rec.get("Company Name", "")
-        tracker_mark_read(jid, COUNTRY_KEY, rec.get("Job URL", ""), title, company)
-        stats["scraped"] += 1
+    global_stats: dict[str, dict[str, int]] = {}
 
-        if _needs_enrichment(rec):
-            logger.info("Enriching from company site: %s", company or title)
-            rec = enricher.enrich(rec)
+    for source_key in args.sources:
+        cls   = SOURCE_REGISTRY[source_key]
+        scraper = cls(http)
+        stats = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
+        global_stats[source_key] = stats
 
-        if not has_application(rec):
-            logger.info("No application email/URL found -> skipping: %s", title)
-            tracker_mark_failed(jid, "no application route")
-            stats["skipped_no_app"] += 1
+        logger.info("")
+        logger.info("╔══════════════════════════════════════╗")
+        logger.info("║  SOURCE: %-28s ║", source_key.upper())
+        logger.info("║  URL   : %-28s ║", cls.base_url)
+        logger.info("╚══════════════════════════════════════╝")
+
+        for rec in scraper.run(args.limit, processed_ids, processed_urls):
+            jid     = rec.pop("_job_id")
+            title   = rec.get("Job Title", "")
+            company = rec.get("Company Name", "")
+
+            tracker_mark_read(jid, source_key, rec.get("Job URL", ""), title, company)
+            stats["scraped"] += 1
+
+            logger.info(
+                "[%s] ── Job #%d ──  '%s'  @  '%s'",
+                source_key, stats["scraped"], title, company,
+            )
+
+            # ── Enrichment ───────────────────────────────────────────────────
+            if _needs_enrichment(rec):
+                logger.info("[%s] Enriching company data for '%s'", source_key, company or title)
+                rec = enricher.enrich(rec)
+                logger.info(
+                    "[%s] Post-enrichment: app=%r  website=%r  logo=%r",
+                    source_key,
+                    rec.get("Application", "")[:60],
+                    rec.get("Company Website", "")[:60],
+                    rec.get("Company Logo", "")[:60],
+                )
+
+            # ── Require application route ─────────────────────────────────
+            if not has_application(rec):
+                logger.info(
+                    "[%s] No valid application route found — skipping '%s'",
+                    source_key, title,
+                )
+                tracker_mark_failed(jid, "no application route")
+                stats["skipped_no_app"] += 1
+                _append_csv(rec)
+                continue
+
+            logger.info("[%s] Application route: %s", source_key, rec.get("Application", ""))
             _append_csv(rec)
-            continue
 
-        _append_csv(rec)
-
-        if do_paraphrase:
-            out_title = para.title(title)
-            out_desc = para.description(rec.get("Job Description", ""))
-            out_company = para.company(rec.get("Company Details", "")) if rec.get("Company Details") else ""
-        else:
-            out_title = title
-            out_desc = rec.get("Job Description", "")
-            out_company = rec.get("Company Details", "")
-
-        if args.dry_run:
-            logger.info("[dry-run] would post: %s", out_title)
-            continue
-
-        try:
-            wp.save_company(rec, out_company, tagline="")
-            wp_id, wp_url = wp.save_job(rec, out_title, out_desc)
-            if wp_id:
-                tracker_mark_posted(jid, wp_id, wp_url)
-                stats["posted"] += 1
+            # ── Paraphrase ───────────────────────────────────────────────
+            if do_paraphrase:
+                logger.info("[%s] Paraphrasing title + description…", source_key)
+                out_title   = para.title(title)
+                out_desc    = para.description(rec.get("Job Description", ""))
+                out_company = (para.company(rec.get("Company Details", ""))
+                               if rec.get("Company Details") else "")
+                logger.info("[%s] Paraphrased title: '%s' → '%s'", source_key, title, out_title)
             else:
-                tracker_mark_failed(jid, "wp post returned no id")
+                out_title   = title
+                out_desc    = rec.get("Job Description", "")
+                out_company = rec.get("Company Details", "")
+
+            # ── Post to WordPress ─────────────────────────────────────────
+            if args.dry_run:
+                logger.info("[%s] [dry-run] Would post: '%s'", source_key, out_title)
+                continue
+
+            try:
+                co_id, co_url = wp.save_company(rec, out_company, tagline="")
+                if co_id:
+                    logger.info("[%s] Company saved/found: WP ID %s  %s",
+                                source_key, co_id, co_url)
+
+                wp_id, wp_url = wp.save_job(rec, out_title, out_desc)
+                if wp_id:
+                    tracker_mark_posted(jid, wp_id, wp_url)
+                    stats["posted"] += 1
+                    logger.info("[%s] Posted: WP ID %s  %s", source_key, wp_id, wp_url)
+                else:
+                    tracker_mark_failed(jid, "wp post returned no id")
+                    stats["failed"] += 1
+                    logger.error("[%s] WP post returned no ID for '%s'", source_key, title)
+            except Exception as e:
+                logger.error("[%s] Posting exception for '%s': %s", source_key, title, e)
+                tracker_mark_failed(jid, e)
                 stats["failed"] += 1
-        except Exception as e:
-            logger.error("Posting failed for %s: %s", title, e)
-            tracker_mark_failed(jid, e)
-            stats["failed"] += 1
+
+    # ── Per-source summary ─────────────────────────────────────────────────
+    logger.info("")
+    logger.info("╔══════════════════════════════════════════════════════════╗")
+    logger.info("║                    PER-SOURCE SUMMARY                   ║")
+    logger.info("╠══════════════════════════════════════════════════════════╣")
+    total = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
+    for src, s in global_stats.items():
+        logger.info(
+            "║  %-16s  scraped=%-4d  posted=%-4d  skip=%-4d  fail=%-4d  ║",
+            src, s["scraped"], s["posted"], s["skipped_no_app"], s["failed"],
+        )
+        for k in total:
+            total[k] += s[k]
+    logger.info("╠══════════════════════════════════════════════════════════╣")
+    logger.info(
+        "║  %-16s  scraped=%-4d  posted=%-4d  skip=%-4d  fail=%-4d  ║",
+        "TOTAL", total["scraped"], total["posted"],
+        total["skipped_no_app"], total["failed"],
+    )
+    logger.info("╚══════════════════════════════════════════════════════════╝")
 
     tracker_summary()
-    logger.info("DONE %s | scraped=%d posted=%d skipped(no-app)=%d failed=%d",
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-                stats["scraped"], stats["posted"],
-                stats["skipped_no_app"], stats["failed"])
+    logger.info(
+        "DONE %s | total scraped=%d posted=%d skipped=%d failed=%d",
+        datetime.now().strftime("%Y-%m-%d %H:%M"),
+        total["scraped"], total["posted"],
+        total["skipped_no_app"], total["failed"],
+    )
 
 
 if __name__ == "__main__":
