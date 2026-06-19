@@ -1,8 +1,8 @@
-# Zambia Jobs Scraper — Python dependencies
-# Install: pip install -r requirements.txt
 
-playwright==1.44.0
-beautifulsoup4==4.12.3
-lxml==5.2.2
-openpyxl==3.1.4
-requests==2.32.3
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Optional, for higher-quality paraphrasing (heavy, ~1GB torch). Uncomment to use:
+# sentence-transformers>=2.2
+# language-tool-python>=2.7
