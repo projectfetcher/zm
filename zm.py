@@ -1405,27 +1405,14 @@ class BaseScraper:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 1 — JobwebZambia  (https://jobwebzambia.com)
-#
-# Description selector (mirrors the original jQuery used on the site):
-#   #mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)
-#
-# BeautifulSoup equivalent:
-#   soup.select_one("#mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)")
-#
-# Fallback chain:
-#   1. Precise CSS selector above
-#   2. Any <font> tag inside the single-section div (picks longest)
-#   3. Generic _main_content() extractor
 # ════════════════════════════════════════════════════════════════════════════
 class JobwebZambia(BaseScraper):
     source_key = "jobwebzambia"
     base_url = "https://jobwebzambia.com"
 
-    # ── CSS selector that mirrors the site's own jQuery path ──────────────
     _DESC_SELECTOR = (
         "#mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)"
     )
-    # Broader fallback: any font element inside the single-section wrapper
     _DESC_FALLBACK_SELECTOR = "#mainContent div.section.single div font"
 
     def iter_job_links(self, max_jobs):
@@ -1471,15 +1458,6 @@ class JobwebZambia(BaseScraper):
         return links if not max_jobs else links[:max_jobs]
 
     def _extract_description(self, soup: BeautifulSoup, html: str) -> str:
-        """
-        Extract job description using the precise CSS selector that mirrors
-        the site's jQuery:
-            #mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)
-
-        Falls back progressively to avoid empty results if the site's DOM
-        shifts slightly between pages.
-        """
-        # 1 ── Precise selector (exact jQuery equivalent)
         node = soup.select_one(self._DESC_SELECTOR)
         if node:
             text = node.get_text("\n", strip=True)
@@ -1488,15 +1466,12 @@ class JobwebZambia(BaseScraper):
                 return text
             logger.debug("[jobwebzambia] Precise selector found node but text too short (%d words)", len(text.split()))
 
-        # 2 ── Relax nth-child(8) — try all <font> children of the 2nd div
         wrapper = soup.select_one("#mainContent > div.section.single > div:nth-child(2)")
         if wrapper:
-            # Collect all <font> tags, pick the longest text
             font_texts = [
                 f.get_text("\n", strip=True)
                 for f in wrapper.find_all("font", recursive=False)
             ]
-            # Also try nested fonts (some pages wrap in extra divs)
             if not font_texts:
                 font_texts = [f.get_text("\n", strip=True) for f in wrapper.find_all("font")]
             if font_texts:
@@ -1505,7 +1480,6 @@ class JobwebZambia(BaseScraper):
                     logger.debug("[jobwebzambia] Description via relaxed font selector (%d chars)", len(best))
                     return best
 
-        # 3 ── Broader fallback selector
         nodes = soup.select(self._DESC_FALLBACK_SELECTOR)
         if nodes:
             best = max((n.get_text("\n", strip=True) for n in nodes), key=len, default="")
@@ -1513,18 +1487,10 @@ class JobwebZambia(BaseScraper):
                 logger.debug("[jobwebzambia] Description via broad font selector (%d chars)", len(best))
                 return best
 
-        # 4 ── Generic content extractor (last resort)
         logger.debug("[jobwebzambia] Falling back to _main_content()")
         return _main_content(soup)
 
     def _extract_application_email(self, soup: BeautifulSoup) -> str:
-        """
-        Extract the application email from jobwebzambia pages.
-        The site often obfuscates emails as [email protected]; we look for
-        the real email in mailto: links, visible text near 'apply', or
-        the standard extract_application() helper.
-        """
-        # Priority: mailto: links
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href.lower().startswith("mailto:"):
@@ -1536,11 +1502,9 @@ class JobwebZambia(BaseScraper):
     def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
 
-        # ── Title ──────────────────────────────────────────────────────────
         h1 = soup.find("h1")
         title = _clean_title(h1.get_text() if h1 else _og(soup, "og:title"))
 
-        # ── Company name ───────────────────────────────────────────────────
         company_name = ""
         for sel in [".company-name", ".job-company", "span.company", "p.company",
                     ".employer-name", "a.company"]:
@@ -1551,13 +1515,9 @@ class JobwebZambia(BaseScraper):
         if not company_name:
             company_name = _company_from_title(title)
 
-        # ── Application email ──────────────────────────────────────────────
         application_email = self._extract_application_email(soup)
-
-        # ── Description (precise selector with fallback chain) ─────────────
         description = self._extract_description(soup, html)
 
-        # Replace obfuscated [email protected] placeholder with real email if found
         if application_email:
             description = description.replace("[email protected]", application_email)
 
@@ -1767,221 +1727,11 @@ class GoZambiaJobs(BaseScraper):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SOURCE 3 — JobSearchZM  (https://jobsearchzm.com)
-# ════════════════════════════════════════════════════════════════════════════
-class JobSearchZM(BaseScraper):
-    source_key = "jobsearchzm"
-    base_url = "https://jobsearchzm.com"
-
-    _DETAIL_PATTERNS = [
-        re.compile(r"https://(?:www\.)?jobsearchzm\.com/job/\d+/[a-z0-9\-]+/?$"),
-        re.compile(r"https://(?:www\.)?jobsearchzm\.com/jobs?/[a-z0-9\-]+/?$"),
-        re.compile(r"https://(?:www\.)?jobsearchzm\.com/vacancies?/[a-z0-9\-]+/?$"),
-        re.compile(r"https://(?:www\.)?jobsearchzm\.com/\d+/[a-z0-9\-]+/?$"),
-    ]
-
-    def _is_detail(self, url: str) -> bool:
-        url = url.rstrip("/").split("?")[0]
-        if any(p.match(url) for p in self._DETAIL_PATTERNS):
-            return True
-        path = urlparse(url).path.rstrip("/")
-        parts = [p for p in path.split("/") if p]
-        if len(parts) >= 2:
-            last = parts[-1]
-            return ("-" in last and len(last) > 10) or _JOB_HINT.search(last) is not None
-        return False
-
-    def iter_job_links(self, max_jobs):
-        logger.info("[jobsearchzm] Collecting job links")
-        links: list[str] = []
-        seen: set[str] = set()
-
-        def _add(href: str):
-            href = href.rstrip("/").split("?")[0].split("#")[0]
-            if href and href not in seen and domain_of(href) in ("jobsearchzm.com", "www.jobsearchzm.com"):
-                if self._is_detail(href):
-                    seen.add(href)
-                    links.append(href)
-
-        page = 0
-        while True:
-            page += 1
-            if max_jobs and len(links) >= max_jobs:
-                break
-            base_candidates = [
-                f"{self.base_url}/",
-                f"{self.base_url}/jobs/",
-                f"{self.base_url}/vacancies/",
-            ] if page == 1 else [
-                f"{self.base_url}/jobs/page/{page}/",
-                f"{self.base_url}/jobs/?page={page}",
-                f"{self.base_url}/?paged={page}",
-                f"{self.base_url}/?page={page}",
-            ]
-            for idx_url in base_candidates:
-                logger.info("[jobsearchzm] Scanning index page: %s", idx_url)
-                html = self.http.get_text(idx_url)
-                if not html:
-                    continue
-                soup = BeautifulSoup(html, "html.parser")
-
-                for card_sel in [
-                    ".job-box a", ".job-card a", ".job-item a",
-                    "article.job a", ".listing-item a",
-                    "h2 a", "h3 a", ".job_listing a",
-                    "a.job-link", "a.listing-title",
-                ]:
-                    for a in soup.select(card_sel):
-                        if a.get("href"):
-                            _add(urljoin(self.base_url, a["href"]))
-
-                for a in soup.find_all("a", href=True):
-                    candidate = urljoin(self.base_url, a["href"])
-                    _add(candidate)
-
-            logger.info("[jobsearchzm] After page %d scan: %d links", page, len(links))
-
-        if len(links) < 5:
-            for api_url in [
-                f"{self.base_url}/wp-json/wp/v2/posts?per_page=50&orderby=date&order=desc",
-                f"{self.base_url}/wp-json/wp/v2/job_listing?per_page=50&orderby=date&order=desc",
-            ]:
-                logger.info("[jobsearchzm] Trying REST API: %s", api_url)
-                resp = self.http.get(api_url)
-                if resp and resp.status_code == 200:
-                    try:
-                        for item in resp.json():
-                            lnk = item.get("link") or ""
-                            if lnk:
-                                _add(lnk)
-                    except Exception as e:
-                        logger.warning("[jobsearchzm] REST API error: %s", e)
-
-        logger.info("[jobsearchzm] Total job links collected: %d", len(links))
-        return links if not max_jobs else links[:max_jobs]
-
-    def parse_detail(self, html: str, url: str) -> dict:
-        soup = BeautifulSoup(html, "html.parser")
-
-        title = ""
-        for t_sel in ["h1.job-title", "h1.entry-title", ".job-title h1",
-                      "h1", ".listing-title"]:
-            node = soup.select_one(t_sel)
-            if node:
-                title = _clean_title(node.get_text())
-                break
-        if not title:
-            title = _clean_title(_og(soup, "og:title"))
-
-        company_name = ""
-        for c_sel in [".company-name", ".employer-name", ".company",
-                      ".job-company", "span.company", ".hiring-company"]:
-            node = soup.select_one(c_sel)
-            if node:
-                company_name = sanitize_text(node.get_text())
-                break
-        if not company_name:
-            company_name = _company_from_title(title)
-
-        logo = ""
-        for logo_sel in [".company-logo img", ".employer-logo img",
-                         "img.company-logo", ".logo img"]:
-            node = soup.select_one(logo_sel)
-            if node and node.get("src"):
-                logo = urljoin(url, node["src"])
-                break
-        if not logo:
-            logo = _og(soup, "og:image")
-
-        meta: dict[str, str] = {}
-        for row in soup.select("table tr, .job-meta tr, .details-list li"):
-            cells = row.find_all(["td", "th", "dt", "dd", "span"])
-            if len(cells) >= 2:
-                key   = sanitize_text(cells[0].get_text()).rstrip(":").lower()
-                value = sanitize_text(cells[1].get_text())
-                if key and value:
-                    meta[key] = value
-        for dl in soup.select("dl.job-overview, dl.details"):
-            dts = dl.find_all("dt")
-            dds = dl.find_all("dd")
-            for dt, dd in zip(dts, dds):
-                meta[sanitize_text(dt.get_text()).rstrip(":").lower()] = sanitize_text(dd.get_text())
-        for item in soup.select(".job-info-item, .meta-item, .detail-item"):
-            label_node = item.select_one(".label, .key, strong, b")
-            value_node = item.select_one(".value, .val, span:last-child")
-            if label_node and value_node:
-                meta[sanitize_text(label_node.get_text()).rstrip(":").lower()] = \
-                    sanitize_text(value_node.get_text())
-
-        def _meta(*keys):
-            for k in keys:
-                if k in meta:
-                    return meta[k]
-            return ""
-
-        location   = _meta("location", "job location", "city", "town", "region")
-        job_type   = _meta("job type", "employment type", "contract type", "type")
-        deadline   = _meta("deadline", "closing date", "apply by", "close date", "expiry")
-        salary     = _meta("salary", "remuneration", "pay", "wage", "compensation")
-        experience = _meta("experience", "years of experience", "experience required")
-        qual       = _meta("qualification", "education", "minimum qualification", "degree")
-        field      = _meta("category", "sector", "department", "job field", "industry")
-
-        extra: dict = {}
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string or "{}")
-            except Exception:
-                continue
-            for node in (data if isinstance(data, list) else [data]):
-                if not isinstance(node, dict):
-                    continue
-                if str(node.get("@type", "")).lower() == "jobposting":
-                    extra["Date Posted"]  = node.get("datePosted", "")[:10]
-                    extra["Deadline"]     = node.get("validThrough", "")[:10]
-                    jl = node.get("jobLocation") or {}
-                    if isinstance(jl, dict):
-                        addr = jl.get("address") or {}
-                        extra["Job Location"] = sanitize_text(
-                            addr.get("addressLocality", "") or addr.get("addressRegion", ""))
-                    extra["Job Type"]     = sanitize_text(node.get("employmentType", ""))
-                    extra["Job Description"] = sanitize_text(node.get("description", ""))
-                    horg = node.get("hiringOrganization") or {}
-                    if not company_name and horg.get("name"):
-                        company_name = sanitize_text(horg["name"])
-                    if not logo and horg.get("logo"):
-                        logo = sanitize_text(horg["logo"], is_url=True)
-
-        logger.debug("[jobsearchzm] title=%r  company=%r  location=%r  type=%r  deadline=%r",
-                     title, company_name, location, job_type, deadline)
-
-        result = {
-            "Job Title":          title,
-            "Company Name":       company_name,
-            "Company Logo":       logo,
-            "Job Location":       location or DEFAULT_LOCATION,
-            "Job Type":           job_type,
-            "Deadline":           deadline,
-            "Salary Range":       salary,
-            "Job Experience":     experience,
-            "Job Qualifications": qual,
-            "Job Field":          field,
-            "Date Posted":        extra.get("Date Posted") or _published(soup),
-            "Job Description":    extra.get("Job Description") or _main_content(soup),
-        }
-        for k, v in extra.items():
-            if v and not result.get(k):
-                result[k] = v
-        return result
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Source registry
+# Source registry  (jobsearchzm removed)
 # ════════════════════════════════════════════════════════════════════════════
 SOURCE_REGISTRY = {
-    "jobwebzambia":  JobwebZambia,
-    "gozambiajobs":  GoZambiaJobs,
-    "jobsearchzm":   JobSearchZM,
+    "jobwebzambia": JobwebZambia,
+    "gozambiajobs": GoZambiaJobs,
 }
 
 _ALL_SOURCES = list(SOURCE_REGISTRY.keys())
