@@ -1,8 +1,5 @@
-
-requests>=2.31
-beautifulsoup4>=4.12
-lxml>=5.0
-
-# Optional, for higher-quality paraphrasing (heavy, ~1GB torch). Uncomment to use:
-# sentence-transformers>=2.2
-# language-tool-python>=2.7
+pandas>=2.0.0
+requests>=2.31.0
+sentence-transformers>=2.7.0
+language-tool-python==2.7.1
+nltk>=3.8.0
