@@ -84,6 +84,9 @@ OUTPUT_CSV   = "scraped_zambia.csv"
 #   key  -> used in --sources CLI arg and tracker "Source" column
 SOURCE_REGISTRY: dict[str, type] = {}   # filled after class definitions
 
+# ── Default jobs per source ───────────────────────────────────────────────────
+DEFAULT_LIMIT = 10
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Secrets
@@ -212,10 +215,8 @@ def sanitize_text(text, is_url: bool = False, is_email: bool = False) -> str:
 # Description cleaning  (removes AI-generated noise from source sites)
 # ════════════════════════════════════════════════════════════════════════════
 
-# Lines / sentences that are pure noise injected by AI-generated source content
 _NOISE_LINE_RE = re.compile(
     r"""(?:
-        # AI meta-commentary that leaked into descriptions
         it\s+appears\s+(you|that)\b |
         could\s+you\s+please\s+(share|provide) |
         please\s+provide\s+the\s+(full|original|complete)\s+ |
@@ -227,43 +228,30 @@ _NOISE_LINE_RE = re.compile(
         here['']?s?\s+(the\s+)?(revised|rewritten)\s+(version|paragraph) |
         rewritten?\s+version\s*: |
         rephrased\s+version\s*: |
-
-        # Prompt / instruction artifacts
         output\s+only\s+the\s+rewritten |
         rewrite\s+this\s+job\s+(description|title) |
         preserve\s+all\s+(original\s+)?facts |
         use\s+different\s+(sentence\s+structure|vocabulary|wording) |
         note\s*:\s+since\s+the\s+original\s+paragraph |
-
-        # Stand-alone label lines (whole line is just a label)
         ^(paragraph|version|revised|professional\s+version|professional\s+rewriting)\s*:?\s*$ |
         ^note\s*:?\s*$ |
-
-        # Site-wide subscription / UI boilerplate
         ^we\s+ensure\s+you\s+remain\s+informed\s+of\s+every\s+new\s+job |
         ^we\s+encourage\s+you\s+to\s+register\s+for\s+updates |
         ^we\s+have\s+initiated\s+the\s+development\s+of\s+our\s+corporate |
         select\s+the\s+subscription\s+option |
         register\s+for\s+updates\s+and\s+notifications |
-
-        # Single-word UI noise
         ^follow\s*$ | ^browse\s+by\s*$ | ^date\s+posted\s*$ |
         ^(today|this\s+week|last\s+week|this\s+month)\s*$ |
         ^latest\s+jobs\s+posted\s*$ |
         ^hot\s*$ | ^or\s*$ |
         ^name\s*\*?\s*$ | ^message\s*\*?\s*$ |
-
-        # Salary filter UI rows
         ^(100[,.]?000\s+and\s+above|less\s+than\s+20[,.]?000)\s*$ |
         ^(80[,.]?000\s*[–\-]\s*100[,.]?000)\s*$ |
-
-        # Notes in parentheses that are AI self-notes
         ^\(note:\s
     )""",
     re.I | re.X | re.MULTILINE,
 )
 
-# Boilerplate blocks that should truncate the description at first match
 _BOILERPLATE_CUTOFF_RE = re.compile(
     r"""(?:
         we\s+invite\s+you\s+to\s+submit\s+your\s+application\s+for\s+this\s+exciting\s+opportunity |
@@ -282,16 +270,13 @@ _BOILERPLATE_CUTOFF_RE = re.compile(
     re.I | re.X | re.DOTALL,
 )
 
-# Bracket placeholders: [City, State], [X years], [Job Title], etc.
 _BRACKET_RE = re.compile(r"\[[^\]]{1,80}\]")
 _TINY_BRACKET_LINE_RE = re.compile(r"^\s*\[[^\]]{1,15}\]\s*[.,]?\s*$")
 
 
 def _should_drop_placeholder_line(line: str) -> bool:
-    """Drop a line if bracket placeholders dominate and real words < 3."""
     if not _BRACKET_RE.search(line):
         return False
-    # Bare tiny placeholder like "[X]" or "[Job Title]"
     if _TINY_BRACKET_LINE_RE.match(line):
         return True
     bracket_text = " ".join(_BRACKET_RE.findall(line))
@@ -302,33 +287,23 @@ def _should_drop_placeholder_line(line: str) -> bool:
 
 
 def clean_description(text: str) -> str:
-    """
-    Strip AI-generated noise, placeholder template lines, and site boilerplate
-    from a scraped job description *before* paraphrasing or posting.
-
-    Preserves all legitimate job content including sentences that happen to
-    contain bracket placeholders alongside real words.
-    """
     if not text:
         return ""
 
     text = fix_mojibake(text)
 
-    # 1. Line-by-line noise removal (runs FIRST so opening noise doesn't trigger cutoff)
     clean_lines: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
 
         if not stripped:
-            clean_lines.append("")   # preserve paragraph breaks
+            clean_lines.append("")
             continue
 
-        # Drop noise sentences / labels
         if _NOISE_LINE_RE.search(stripped):
             logger.debug("[clean_description] Dropped noise line: %r", stripped[:80])
             continue
 
-        # Drop lines dominated by bracket placeholders
         if _should_drop_placeholder_line(stripped):
             logger.debug("[clean_description] Dropped placeholder line: %r", stripped[:80])
             continue
@@ -337,15 +312,12 @@ def clean_description(text: str) -> str:
 
     text = "\n".join(clean_lines)
 
-    # 2. NOW apply closing boilerplate cutoff on the already-cleaned text
     m = _BOILERPLATE_CUTOFF_RE.search(text)
     if m:
         text = text[:m.start()].strip()
 
-    # 3. Collapse excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # 4. Split into paragraphs, drop any that are too short to be meaningful
     paras = [p.strip() for p in text.split("\n\n")]
     paras = [p for p in paras if p and len(p.split()) >= 4]
 
@@ -720,15 +692,7 @@ def _clean_para(text: str) -> str:
 
 
 class Paraphraser:
-    """Mistral-backed paraphraser.
-
-    Key behaviours
-    ──────────────
-    • If MISTRAL_API_KEY is missing  → passthrough (no API calls at all).
-    • If the FIRST live API call returns HTTP 401/403 → permanently disabled
-      for this run; no further calls are ever made.
-    • Verbose per-attempt logging matches the expected output format.
-    """
+    """Mistral-backed paraphraser."""
 
     def __init__(self):
         self.api_key = get_secret("MISTRAL_API_KEY")
@@ -1403,7 +1367,6 @@ class BaseScraper:
             record["Estimated Deadline"] = estimated_deadline(
                 record["Date Posted"], record["Deadline"])
 
-            # ── Clean description of AI noise BEFORE storing / paraphrasing ──
             raw_desc = record.get("Job Description", "")
             cleaned_desc = clean_description(raw_desc)
             if cleaned_desc != raw_desc:
@@ -1442,10 +1405,28 @@ class BaseScraper:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 1 — JobwebZambia  (https://jobwebzambia.com)
+#
+# Description selector (mirrors the original jQuery used on the site):
+#   #mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)
+#
+# BeautifulSoup equivalent:
+#   soup.select_one("#mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)")
+#
+# Fallback chain:
+#   1. Precise CSS selector above
+#   2. Any <font> tag inside the single-section div (picks longest)
+#   3. Generic _main_content() extractor
 # ════════════════════════════════════════════════════════════════════════════
 class JobwebZambia(BaseScraper):
     source_key = "jobwebzambia"
     base_url = "https://jobwebzambia.com"
+
+    # ── CSS selector that mirrors the site's own jQuery path ──────────────
+    _DESC_SELECTOR = (
+        "#mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)"
+    )
+    # Broader fallback: any font element inside the single-section wrapper
+    _DESC_FALLBACK_SELECTOR = "#mainContent div.section.single div font"
 
     def iter_job_links(self, max_jobs):
         logger.info("[jobwebzambia] Collecting job links from index + RSS feed")
@@ -1489,24 +1470,106 @@ class JobwebZambia(BaseScraper):
         logger.info("[jobwebzambia] Total job links collected: %d", len(links))
         return links if not max_jobs else links[:max_jobs]
 
-    def parse_detail(self, html, url):
+    def _extract_description(self, soup: BeautifulSoup, html: str) -> str:
+        """
+        Extract job description using the precise CSS selector that mirrors
+        the site's jQuery:
+            #mainContent > div.section.single > div:nth-child(2) > font:nth-child(8)
+
+        Falls back progressively to avoid empty results if the site's DOM
+        shifts slightly between pages.
+        """
+        # 1 ── Precise selector (exact jQuery equivalent)
+        node = soup.select_one(self._DESC_SELECTOR)
+        if node:
+            text = node.get_text("\n", strip=True)
+            if len(text.split()) >= 20:
+                logger.debug("[jobwebzambia] Description via precise selector (%d chars)", len(text))
+                return text
+            logger.debug("[jobwebzambia] Precise selector found node but text too short (%d words)", len(text.split()))
+
+        # 2 ── Relax nth-child(8) — try all <font> children of the 2nd div
+        wrapper = soup.select_one("#mainContent > div.section.single > div:nth-child(2)")
+        if wrapper:
+            # Collect all <font> tags, pick the longest text
+            font_texts = [
+                f.get_text("\n", strip=True)
+                for f in wrapper.find_all("font", recursive=False)
+            ]
+            # Also try nested fonts (some pages wrap in extra divs)
+            if not font_texts:
+                font_texts = [f.get_text("\n", strip=True) for f in wrapper.find_all("font")]
+            if font_texts:
+                best = max(font_texts, key=len)
+                if len(best.split()) >= 20:
+                    logger.debug("[jobwebzambia] Description via relaxed font selector (%d chars)", len(best))
+                    return best
+
+        # 3 ── Broader fallback selector
+        nodes = soup.select(self._DESC_FALLBACK_SELECTOR)
+        if nodes:
+            best = max((n.get_text("\n", strip=True) for n in nodes), key=len, default="")
+            if len(best.split()) >= 20:
+                logger.debug("[jobwebzambia] Description via broad font selector (%d chars)", len(best))
+                return best
+
+        # 4 ── Generic content extractor (last resort)
+        logger.debug("[jobwebzambia] Falling back to _main_content()")
+        return _main_content(soup)
+
+    def _extract_application_email(self, soup: BeautifulSoup) -> str:
+        """
+        Extract the application email from jobwebzambia pages.
+        The site often obfuscates emails as [email protected]; we look for
+        the real email in mailto: links, visible text near 'apply', or
+        the standard extract_application() helper.
+        """
+        # Priority: mailto: links
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.lower().startswith("mailto:"):
+                email = href.split(":", 1)[1].split("?")[0].strip()
+                if email and not EMAIL_BLOCKLIST.search(email):
+                    return sanitize_text(email, is_email=True)
+        return ""
+
+    def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
+
+        # ── Title ──────────────────────────────────────────────────────────
         h1 = soup.find("h1")
         title = _clean_title(h1.get_text() if h1 else _og(soup, "og:title"))
-        company_name = _company_from_title(title)
 
-        for sel in [".company-name", ".job-company", "span.company", "p.company"]:
+        # ── Company name ───────────────────────────────────────────────────
+        company_name = ""
+        for sel in [".company-name", ".job-company", "span.company", "p.company",
+                    ".employer-name", "a.company"]:
             node = soup.select_one(sel)
             if node:
                 company_name = sanitize_text(node.get_text())
                 break
+        if not company_name:
+            company_name = _company_from_title(title)
 
-        logger.debug("[jobwebzambia] title=%r  company=%r", title, company_name)
+        # ── Application email ──────────────────────────────────────────────
+        application_email = self._extract_application_email(soup)
+
+        # ── Description (precise selector with fallback chain) ─────────────
+        description = self._extract_description(soup, html)
+
+        # Replace obfuscated [email protected] placeholder with real email if found
+        if application_email:
+            description = description.replace("[email protected]", application_email)
+
+        logger.debug("[jobwebzambia] title=%r  company=%r  email=%r  desc_len=%d",
+                     title, company_name, application_email, len(description))
+
         return {
             "Job Title":       title,
             "Company Name":    company_name,
             "Company Logo":    _og(soup, "og:image"),
-            "Job Description": _main_content(soup),
+            "Job Description": description,
+            "Application":     application_email,
             "Date Posted":     _published(soup),
         }
 
@@ -1952,8 +2015,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"Available sources: {', '.join(_ALL_SOURCES)}",
     )
-    ap.add_argument("--limit",        type=int, default=0,
-                    help="max jobs per source (default: 0 = scrape everything available)")
+    ap.add_argument("--limit",        type=int, default=DEFAULT_LIMIT,
+                    help=f"max jobs per source (default: {DEFAULT_LIMIT}; use 0 for unlimited)")
     ap.add_argument("--sources",      nargs="+", default=_ALL_SOURCES,
                     choices=_ALL_SOURCES, metavar="SOURCE",
                     help=f"which sources to run (default: all). choices: {_ALL_SOURCES}")
