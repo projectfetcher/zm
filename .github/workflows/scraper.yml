@@ -1,96 +1,79 @@
-# ─────────────────────────────────────────────────────────────────
-# GitHub Actions — Zambia Jobs Scraper
-# Runs daily at 06:00 UTC, or manually via workflow_dispatch
-# ─────────────────────────────────────────────────────────────────
-name: Scraper
+name: Scrape Zambia Jobs
 
+# Each country runs independently on its own schedule.
 on:
   schedule:
-    - cron: "0 6 * * *"          # every day at 06:00 UTC (08:00 Lusaka time)
-  workflow_dispatch:              # manual trigger from GitHub Actions UI
+    - cron: "0 6 * * *"
+  workflow_dispatch:
     inputs:
-      max_pages:
-        description: "Pages to crawl per site"
-        required: false
-        default: "5"
-      post_to_wp:
-        description: "Post jobs to WordPress? (true/false)"
-        required: false
-        default: "true"
-      sites:
-        description: "Sites to scrape (space-separated: gozambia zambiajob cvpeople jobsearchzm greatzambia all)"
-        required: false
-        default: "all"
+      limit:
+        description: "Max jobs this run"
+        default: "15"
+      dry_run:
+        description: "Dry run (no WordPress posting)?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # commit this country's tracker back to the repo
+
+concurrency:
+  group: scrape-zambia
+  cancel-in-progress: false
 
 jobs:
   scrape:
-    name: Scrape Zambia Jobs
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    
+    defaults:
+      run:
+        working-directory: zambia
     steps:
-      # ── 1. Checkout repo
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── 2. Set up Python
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
+          cache-dependency-path: zambia/requirements.txt
 
-      # ── 3. Install Python dependencies
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      # ── 4. Install Playwright browsers
-      - name: Install Playwright Chromium
-        run: playwright install chromium --with-deps
-
-      # ── 5. Run scraper
-      - name: Run Zambia Jobs Scraper
-        env:
-          WP_URL:  ${{ secrets.ZAMBIA_WP_URL }}
-          WP_USER: ${{ secrets.WP_USER }}
-          WP_PASS: ${{ secrets.WP_APP_PASSWORD }}
+      - name: Install dependencies
         run: |
-          MAX_PAGES="${{ github.event.inputs.max_pages || '5' }}"
-          POST_WP="${{ github.event.inputs.post_to_wp || 'true' }}"
-          SITES="${{ github.event.inputs.sites || 'all' }}"
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          CMD="python3 zambia_jobs_scraper_v2.py --max-pages $MAX_PAGES --output zambia_jobs.xlsx"
+      - name: Run Zambia scraper
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          WP_BASE_URL:     ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME:     ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          WP_VERIFY_SSL:   ${{ secrets.WP_VERIFY_SSL }}
+        run: |
+          python zm.py \
+            --limit ${{ github.event.inputs.limit || '15' }} \
+            ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
 
-          # Append --post-wp flag if enabled
-          if [ "$POST_WP" = "true" ]; then
-            CMD="$CMD --post-wp"
-          fi
-
-          # Append site selection if not 'all'
-          if [ "$SITES" != "all" ]; then
-            CMD="$CMD --sites $SITES"
-          fi
-
-          echo "Running: $CMD"
-          eval $CMD
-
-      # ── 6. Upload Excel as artifact (kept 30 days)
-      - name: Upload Excel results
-        uses: actions/upload-artifact@v4
+      - name: Persist tracker
         if: always()
-        with:
-          name: zambia-jobs-${{ github.run_number }}-${{ github.run_attempt }}
-          path: zambia_jobs.xlsx
-          retention-days: 30
-
-      # ── 7. Commit Excel back to repo (optional — comment out if not needed)
-      - name: Commit results to repo
-        if: github.event_name == 'schedule' || github.event.inputs.post_to_wp == 'true'
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add zambia_jobs.xlsx
-          git diff --cached --quiet || git commit -m "chore: zambia jobs update $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          cd "$GITHUB_WORKSPACE"
+          git config user.name  "job-scraper-bot"
+          git config user.email "actions@github.com"
+          git add zambia/processed_zambia.csv zambia/scraped_zambia.csv || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(zambia): update tracker [skip ci] $(date -u +%F)"
+            git push
+          else
+            echo "No tracker changes to commit."
+          fi
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-zambia
+          path: |
+            zambia/scraped_zambia.csv
+            zambia/processed_zambia.csv
+          if-no-files-found: ignore
