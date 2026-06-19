@@ -516,7 +516,18 @@ class CompanyEnricher:
 # ════════════════════════════════════════════════════════════════════════════
 _st_model = None
 try:
+    # Suppress tqdm progress bars that sentence-transformers emits per batch
+    import os as _os
+    _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from sentence_transformers import SentenceTransformer, util as _st_util
+    import sentence_transformers.util as _stu          # noqa: F401
+    try:
+        from tqdm import tqdm as _tqdm
+        _tqdm.__init__.__defaults__  # exists on all tqdm versions
+        import functools, tqdm as _tqdm_mod
+        _tqdm_mod.tqdm = functools.partial(_tqdm_mod.tqdm, disable=True)
+    except Exception:
+        pass
     _st_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
     logger.info("sentence-transformers loaded for similarity scoring")
 except Exception:
@@ -566,14 +577,27 @@ def _clean_para(text: str) -> str:
 
 
 class Paraphraser:
+    """Mistral-backed paraphraser.
+
+    Key behaviours
+    ──────────────
+    • If MISTRAL_API_KEY is missing  → passthrough (no API calls at all).
+    • If the FIRST live API call returns HTTP 401/403 → permanently disabled
+      for this run; no further calls are ever made (avoids burning hundreds
+      of doomed retries like the original bug).
+    • Verbose per-attempt logging matches the expected output format.
+    """
+
     def __init__(self):
         self.api_key = get_secret("MISTRAL_API_KEY")
         self.enabled = bool(self.api_key)
+        self._auth_bad = False          # set True on first 401/403 → stops all calls
         if not self.enabled:
             logger.warning("MISTRAL_API_KEY not set — paraphrasing disabled (passthrough)")
 
+    # ── Low-level call ────────────────────────────────────────────────────────
     def _generate(self, prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
-        if not self.enabled:
+        if not self.enabled or self._auth_bad:
             return ""
         try:
             r = requests.post(
@@ -585,40 +609,122 @@ class Paraphraser:
                       "max_tokens": max_tokens, "temperature": temperature},
                 timeout=30,
             )
+            if r.status_code in (401, 403):
+                logger.error(
+                    "Mistral auth failed (%d) — MISTRAL_API_KEY is invalid or expired. "
+                    "Paraphrasing disabled for this run. Fix the secret and re-run.",
+                    r.status_code,
+                )
+                self._auth_bad = True
+                self.enabled   = False
+                return ""
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
+        except requests.exceptions.HTTPError:
+            return ""          # already logged above for 401/403; other HTTP errors are rare
         except Exception as e:
             logger.error("Mistral error: %s", e)
             return ""
 
+    # ── Title paraphrase ──────────────────────────────────────────────────────
     def title(self, title: str) -> str:
         clean = sanitize_text(title)
         if not clean or not self.enabled:
             return clean
+
+        MAX_ATTEMPTS = 4
+        print(f"\n ┌─ TITLE PARAPHRASE {'─'*45}")
+        print(f" │ Original : \"{clean}\"")
+        print(f" │ {'─'*64}")
+
         best, best_sim = None, 0.0
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
+            if not self.enabled:          # auth failed mid-loop
+                break
             temp = round(0.68 + attempt * 0.06, 2)
             prompt = ("Rewrite this job title professionally using different words. "
                       "Output ONLY the rewritten title. Keep it 4-12 words.\n\n"
                       f"Job title: {clean}")
             res = _clean_para(self._generate(prompt, 50, temp)).split("\n")[0].strip().strip('"\'')
-            wc = len(res.split())
-            sim = _similarity(clean, res)
-            if res and 4 <= wc <= 14 and sim >= 0.55 and res.lower() != clean.lower():
+            wc  = len(res.split())
+            sim = _similarity(clean, res) if res else 0.0
+            dup = res.lower() == clean.lower()
+
+            print(f" │ Attempt {attempt+1} (temp={temp}):")
+            print(f" │    Output  : \"{res}\"" if res else " │    Output  : (empty)")
+            print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes' if dup else 'No'}")
+
+            ok = res and 4 <= wc <= 14 and sim >= 0.55 and not dup
+            if ok:
+                print(f" │    → ✅ ACCEPTED (sim={sim:.3f})")
                 if sim > best_sim:
                     best, best_sim = res, sim
+                break
+            else:
+                reasons = []
+                if not res:          reasons.append("empty output")
+                if wc < 4:           reasons.append(f"too short ({wc} words, min=4)")
+                if wc > 14:          reasons.append(f"too long ({wc} words, max=14)")
+                if sim < 0.55:       reasons.append(f"sim={sim:.3f} < 0.55")
+                if dup:              reasons.append("duplicate of original")
+                print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
+                if res and sim > best_sim:
+                    best, best_sim = res, sim
+            print(f" │ {'─'*64}")
             time.sleep(0.5)
-        return best or clean
 
+        chosen = best or clean
+        if best:
+            print(f" │ ✅ Final paraphrase  : \"{chosen}\"")
+        else:
+            print(f" │ ⚠️  No valid paraphrase found → Keeping original: \"{clean}\"")
+        print(f" └{'─'*65}\n")
+        return chosen
+
+    # ── Description paraphrase ────────────────────────────────────────────────
     def description(self, text: str) -> str:
         clean = sanitize_text(text)
         if not clean or not self.enabled:
             return clean
+
         paras = [p.strip() for p in clean.split("\n") if p.strip()]
+        print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paras)} paragraphs) {'─'*25}")
         out = []
-        for para in paras:
-            accepted, best, best_sim = None, None, 0.0
-            for attempt in range(2):
+
+        for pi, para in enumerate(paras, 1):
+            if not self.enabled:          # auth died; pass remaining through
+                out.append(para)
+                continue
+
+            wc_orig = len(para.split())
+            # Skip trivially short paragraphs (headings like "Key Responsibilities")
+            if wc_orig < 5:
+                out.append(para)
+                print(f" │ [Para {pi}/{len(paras)}] SKIPPED (too short: {wc_orig} words) → kept as-is")
+                continue
+
+            print(f"\n │ ┌─ Paragraph {pi}/{len(paras)} {'─'*50}")
+            print(f" │ │ ORIGINAL ({wc_orig} words):")
+            # Print wrapped at ~80 chars
+            words = para.split()
+            line, lines = [], []
+            for w in words:
+                line.append(w)
+                if len(" ".join(line)) > 78:
+                    lines.append(" ".join(line[:-1]))
+                    line = [w]
+            if line:
+                lines.append(" ".join(line))
+            for ln in lines:
+                print(f" │ │    {ln}")
+            print(f" │ │ {'─'*64}")
+
+            accepted, best_res, best_sim = None, None, 0.0
+            MAX_PARA_ATTEMPTS = 3
+
+            for attempt in range(MAX_PARA_ATTEMPTS):
+                if not self.enabled:
+                    break
                 temp = round(0.65 + attempt * 0.08, 2)
                 prompt = ("Rewrite this job description paragraph professionally. "
                           "Keep ALL facts, requirements and responsibilities. "
@@ -626,17 +732,44 @@ class Paraphraser:
                           "Output ONLY the rewritten paragraph.\n\n"
                           f"Original:\n{para}")
                 res = _clean_para(self._generate(prompt, 500, temp))
-                rw = len(res.split())
+                rw  = len(res.split()) if res else 0
                 sim = _similarity(para, res) if rw >= 5 else 0.0
+
+                print(f" │ │ Attempt {attempt+1}/{MAX_PARA_ATTEMPTS} (temp={temp}):")
+                print(f" │ │    Paraphrased : \"{res[:120]}{'...' if len(res) > 120 else ''}\"" if res
+                      else " │ │    Paraphrased : (no output from model)")
+                print(f" │ │    Words: {rw} | Similarity: {sim:.3f}")
+
                 if res and rw >= 8 and sim >= 0.48:
+                    print(f" │ │    → ✅ ACCEPTED")
                     accepted = res
                     break
-                if res and sim > best_sim:
-                    best, best_sim = res, sim
+                else:
+                    reasons = []
+                    if not res:    reasons.append("empty output")
+                    if rw < 8:    reasons.append(f"too short ({rw} words, min=8)")
+                    if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
+                    print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
+                    if res and sim > best_sim:
+                        best_res, best_sim = res, sim
+                print(f" │ │ {'─'*64}")
                 time.sleep(0.5)
-            out.append(accepted or (best if best and best_sim >= 0.40 else para))
+
+            chosen_para = accepted or (best_res if best_res and best_sim >= 0.40 else para)
+            if accepted:
+                print(f" │ │ ✅ ACCEPTED paraphrase used")
+            elif best_res and best_sim >= 0.40:
+                print(f" │ │ ⚠️  BEST ATTEMPT used (sim={best_sim:.3f})")
+            else:
+                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase found")
+                print(f" │ │    (best sim achieved: {best_sim:.3f}, threshold=0.40)")
+            print(f" │ └{'─'*65}")
+            out.append(chosen_para)
+
+        print(f" └{'─'*65}\n")
         return "\n\n".join(out)
 
+    # ── Company paraphrase ────────────────────────────────────────────────────
     def company(self, text: str) -> str:
         clean = sanitize_text(text)
         if not clean or not self.enabled:
@@ -645,9 +778,13 @@ class Paraphraser:
                   "facts. Use different wording. Output ONLY the rewritten text.\n\n"
                   f"Original:\n{clean}")
         res = _clean_para(self._generate(prompt, 600, 0.68))
-        rw = len(res.split())
+        rw  = len(res.split()) if res else 0
         sim = _similarity(clean, res) if rw >= 10 else 0.0
-        return res if (res and rw >= 10 and sim >= 0.40) else clean
+        if res and rw >= 10 and sim >= 0.40:
+            logger.info("Company description paraphrased (sim=%.3f)", sim)
+            return res
+        logger.info("Company description kept original (sim=%.3f < 0.40 or too short)", sim)
+        return clean
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1070,13 +1207,15 @@ class BaseScraper:
         raise NotImplementedError
 
     def run(self, max_jobs: int, processed_ids: set, processed_urls: set):
+        # max_jobs == 0  →  unlimited (scrape everything)
+        quota_str = str(max_jobs) if max_jobs else "unlimited"
         logger.info(
-            "─── [%s] Starting scrape from %s (quota: %d) ───",
-            self.source_key.upper(), self.base_url, max_jobs,
+            "─── [%s] Starting scrape from %s (quota: %s) ───",
+            self.source_key.upper(), self.base_url, quota_str,
         )
         yielded = 0
-        for url in self.iter_job_links(max_jobs * 2):
-            if yielded >= max_jobs:
+        for url in self.iter_job_links(max_jobs):
+            if max_jobs and yielded >= max_jobs:
                 break
             url = sanitize_text(url, is_url=True)
             if not url or url in processed_urls:
@@ -1182,10 +1321,12 @@ class JobwebZambia(BaseScraper):
                     links.append(href)
             logger.info("[jobwebzambia] %d unique links so far after scanning %s", len(links), url)
 
-        # paginate /jobs/ archive as well
+        # paginate /jobs/ archive — no page cap; stop only when site has no more
         page = 1
-        while len(links) < max_jobs and page <= 5:
+        while True:
             page += 1
+            if max_jobs and len(links) >= max_jobs:
+                break
             purl = f"{self.base_url}/jobs/page/{page}/"
             html = self.http.get_text(purl)
             if not html:
@@ -1199,10 +1340,10 @@ class JobwebZambia(BaseScraper):
                     added += 1
             logger.info("[jobwebzambia] Page %d: +%d links (total %d)", page, added, len(links))
             if added == 0:
-                break
+                break   # no new links → last page reached
 
         logger.info("[jobwebzambia] Total job links collected: %d", len(links))
-        return links[:max_jobs]
+        return links if not max_jobs else links[:max_jobs]
 
     def parse_detail(self, html, url):
         soup = BeautifulSoup(html, "html.parser")
@@ -1268,8 +1409,10 @@ class GoZambiaJobs(BaseScraper):
                 logger.info("[gozambiajobs] After feed %s: %d links", feed_url, len(links))
 
         # 2) Paginated index pages
-        for page in range(1, 6):
-            if len(links) >= max_jobs:
+        page = 0
+        while True:
+            page += 1
+            if max_jobs and len(links) >= max_jobs:
                 break
             candidates = [
                 f"{self.base_url}/jobs/page/{page}/",
@@ -1316,7 +1459,7 @@ class GoZambiaJobs(BaseScraper):
                     logger.warning("[gozambiajobs] REST API parse error: %s", e)
 
         logger.info("[gozambiajobs] Total job links collected: %d", len(links))
-        return links[:max_jobs]
+        return links if not max_jobs else links[:max_jobs]
 
     def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
@@ -1477,8 +1620,10 @@ class JobSearchZM(BaseScraper):
                     links.append(href)
 
         # Index pages + pagination
-        for page in range(1, 7):
-            if len(links) >= max_jobs:
+        page = 0
+        while True:
+            page += 1
+            if max_jobs and len(links) >= max_jobs:
                 break
             base_candidates = [
                 f"{self.base_url}/",
@@ -1533,7 +1678,7 @@ class JobSearchZM(BaseScraper):
                         logger.warning("[jobsearchzm] REST API error: %s", e)
 
         logger.info("[jobsearchzm] Total job links collected: %d", len(links))
-        return links[:max_jobs]
+        return links if not max_jobs else links[:max_jobs]
 
     def parse_detail(self, html: str, url: str) -> dict:
         soup = BeautifulSoup(html, "html.parser")
@@ -1699,8 +1844,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"Available sources: {', '.join(_ALL_SOURCES)}",
     )
-    ap.add_argument("--limit",        type=int, default=10,
-                    help="max jobs per source this run (default: 10)")
+    ap.add_argument("--limit",        type=int, default=0,
+                    help="max jobs per source (default: 0 = scrape everything available)")
     ap.add_argument("--sources",      nargs="+", default=_ALL_SOURCES,
                     choices=_ALL_SOURCES, metavar="SOURCE",
                     help=f"which sources to run (default: all). choices: {_ALL_SOURCES}")
@@ -1721,7 +1866,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Zambia Multi-Source Job Scraper")
     logger.info("Sources  : %s", ", ".join(args.sources))
-    logger.info("Limit    : %d jobs/source", args.limit)
+    logger.info("Limit    : %s jobs/source", str(args.limit) if args.limit else "unlimited")
     logger.info("Dry-run  : %s", args.dry_run)
     logger.info("Paraphrase: %s", do_paraphrase)
     logger.info("=" * 60)
@@ -1752,7 +1897,7 @@ def main():
         logger.info("║  URL   : %-28s ║", cls.base_url)
         logger.info("╚══════════════════════════════════════╝")
 
-        for rec in scraper.run(args.limit, processed_ids, processed_urls):
+        for rec in scraper.run(args.limit, processed_ids, processed_urls):  # 0 = unlimited
             jid     = rec.pop("_job_id")
             title   = rec.get("Job Title", "")
             company = rec.get("Company Name", "")
