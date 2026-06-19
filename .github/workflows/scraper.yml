@@ -1,4 +1,4 @@
-name: Run Kenya MimusJobs
+name: Scraper
 
 on:
   schedule:
