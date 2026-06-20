@@ -1631,194 +1631,272 @@ class JobwebZambia(BaseScraper):
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOURCE 2 — GoZambiaJobs  (https://gozambiajobs.com)
+#
+# NOTE — fixed 2026-06-20:
+# The old version scraped every <a href> on the listing pages and matched
+# them against a regex that (unintentionally) matched BOTH real job postings
+# (/jobs/496745465-billing-accountant) AND the site's category archive pages
+# (/jobs/accounting-auditing, /jobs/agriculture, ...). Those category pages
+# have no employer, no application route and barely any content, which is
+# why every single GoZambiaJobs record was being skipped with
+# "no application route".
+#
+# The site also paginates its job index with /jobs (page 1) then
+# /jobs?page=2, /jobs?page=3, ... (NOT /jobs/page/2/ like jobwebzambia), so
+# the old pagination logic was hitting wrong/missing URLs too.
+#
+# Fix: the listing pages ship every job's full data (title, description,
+# employer name/logo/website, location, job type, salary, application
+# email/link, etc.) as inline JSON in a `window.jobsList = ...` script tag.
+# We now parse that JSON directly from /jobs and /jobs?page=N — this is both
+# more reliable (no more category-page false positives) and far more
+# efficient (no extra per-job detail-page fetch needed at all).
 # ════════════════════════════════════════════════════════════════════════════
 class GoZambiaJobs(BaseScraper):
     source_key = "gozambiajobs"
     base_url = "https://gozambiajobs.com"
+    jobs_index_url = "https://gozambiajobs.com/jobs"
 
-    _DETAIL_PATTERNS = [
-        re.compile(r"https://(?:www\.)?gozambiajobs\.com/job/[a-z0-9\-]+/?$"),
-        re.compile(r"https://(?:www\.)?gozambiajobs\.com/jobs/[a-z0-9\-]+/?$"),
-        re.compile(r"https://(?:www\.)?gozambiajobs\.com/\d{4}/\d{2}/\d{2}/[a-z0-9\-]+/?$"),
-    ]
+    # Matches:  window.jobsList = window.jobsList.concat([ ... ]);
+    _JOBLIST_RE = re.compile(
+        r"window\.jobsList\s*=\s*window\.jobsList\.concat\(\s*(\[.*?\])\s*\)\s*;",
+        re.S,
+    )
+    _MAX_PAGES = 20  # hard safety cap against runaway pagination
 
-    def iter_job_links(self, max_jobs):
-        logger.info("[gozambiajobs] Collecting job links")
-        links: list[str] = []
-        seen: set[str] = set()
+    def run(self, max_jobs: int, processed_ids: set, processed_urls: set):
+        quota_str = str(max_jobs) if max_jobs else "unlimited"
+        logger.info(
+            "─── [%s] Starting scrape from %s (quota: %s) ───",
+            self.source_key.upper(), self.jobs_index_url, quota_str,
+        )
 
-        def _add(href: str):
-            href = href.rstrip("/").split("?")[0].split("#")[0]
-            if href not in seen and any(p.match(href) for p in self._DETAIL_PATTERNS):
-                seen.add(href)
-                links.append(href)
+        yielded = 0
+        page = 1
+        empty_streak = 0
+        seen_ids_this_run: set = set()
 
-        for feed_url in [
-            f"{self.base_url}/feed/?post_type=job_listing",
-            f"{self.base_url}/feed/",
-        ]:
-            logger.info("[gozambiajobs] Trying feed: %s", feed_url)
-            html = self.http.get_text(feed_url)
-            if html:
-                for href in re.findall(r"https://(?:www\.)?gozambiajobs\.com/[^\s\"<>]+", html):
-                    _add(href)
-                logger.info("[gozambiajobs] After feed %s: %d links", feed_url, len(links))
-
-        page = 0
         while True:
-            page += 1
-            if max_jobs and len(links) >= max_jobs:
+            if max_jobs and yielded >= max_jobs:
                 break
-            candidates = [
-                f"{self.base_url}/jobs/page/{page}/",
-                f"{self.base_url}/?paged={page}",
-                f"{self.base_url}/job-listings/page/{page}/",
-            ] if page > 1 else [
-                f"{self.base_url}/",
-                f"{self.base_url}/jobs/",
-                f"{self.base_url}/job-listings/",
-            ]
-            for idx_url in candidates:
-                logger.info("[gozambiajobs] Scanning index: %s", idx_url)
-                html = self.http.get_text(idx_url)
-                if not html:
-                    continue
-                soup = BeautifulSoup(html, "html.parser")
-                for card_sel in ["li.job_listing a", "article.job_listing a",
-                                 ".job-listing a", ".job-item a", "h2.job-title a",
-                                 "h3.job-title a", "a.job-title"]:
-                    for a in soup.select(card_sel):
-                        if a.get("href"):
-                            _add(urljoin(self.base_url, a["href"]))
-                for a in soup.find_all("a", href=True):
-                    _add(urljoin(self.base_url, a["href"]))
-
-            logger.info("[gozambiajobs] After page %d scan: %d links", page, len(links))
-
-        if len(links) < 5:
-            logger.info("[gozambiajobs] Trying WP REST API fallback")
-            api_url = f"{self.base_url}/wp-json/wp/v2/job_listing?per_page=50&orderby=date&order=desc"
-            resp = self.http.get(api_url)
-            if resp and resp.status_code == 200:
-                try:
-                    items = resp.json()
-                    for item in items:
-                        lnk = item.get("link") or item.get("guid", {}).get("rendered", "")
-                        if lnk:
-                            _add(lnk)
-                    logger.info("[gozambiajobs] REST API returned %d posts", len(items))
-                except Exception as e:
-                    logger.warning("[gozambiajobs] REST API parse error: %s", e)
-
-        logger.info("[gozambiajobs] Total job links collected: %d", len(links))
-        return links if not max_jobs else links[:max_jobs]
-
-    def parse_detail(self, html: str, url: str) -> dict:
-        soup = BeautifulSoup(html, "html.parser")
-
-        title = ""
-        for t_sel in ["h1.job-title", "h1.entry-title", "h1", "h2.job-title"]:
-            node = soup.select_one(t_sel)
-            if node:
-                title = _clean_title(node.get_text())
-                break
-        if not title:
-            title = _clean_title(_og(soup, "og:title"))
-
-        company_name = ""
-        for c_sel in [".company-title", ".company-name", "span.company",
-                      ".job-company", "a.company", "p.company"]:
-            node = soup.select_one(c_sel)
-            if node:
-                company_name = sanitize_text(node.get_text())
-                break
-        if not company_name:
-            meta_co = soup.find("meta", {"itemprop": "hiringOrganization"})
-            if meta_co:
-                company_name = sanitize_text(meta_co.get("content", ""))
-        if not company_name:
-            company_name = _company_from_title(title)
-
-        logo = ""
-        for logo_sel in [".company-logo img", ".employer-logo img",
-                         "img.company-logo", "img.employer-logo"]:
-            node = soup.select_one(logo_sel)
-            if node and node.get("src"):
-                logo = urljoin(url, node["src"])
-                break
-        if not logo:
-            logo = _og(soup, "og:image")
-
-        location = ""
-        for loc_sel in [".location", ".job-location", "span.location",
-                        "[class*='location']", ".meta-location"]:
-            node = soup.select_one(loc_sel)
-            if node:
-                location = sanitize_text(node.get_text())
+            if page > self._MAX_PAGES:
+                logger.warning("[gozambiajobs] Hit safety page cap (%d) — stopping pagination",
+                               self._MAX_PAGES)
                 break
 
-        job_type = ""
-        for jt_sel in [".job-type", ".type", "li.job-type", ".employment-type"]:
-            node = soup.select_one(jt_sel)
-            if node:
-                job_type = sanitize_text(node.get_text())
+            url = self.jobs_index_url if page == 1 else f"{self.jobs_index_url}?page={page}"
+            logger.info("[gozambiajobs] Fetching listing page %d: %s", page, url)
+            html = self.http.get_text(url)
+            if not html:
+                logger.warning("[gozambiajobs] No response for %s — stopping pagination", url)
                 break
 
-        deadline = ""
-        for d_sel in [".application-deadline", ".deadline", ".closing-date",
-                      "li.date-listed", ".job-expiry"]:
-            node = soup.select_one(d_sel)
-            if node:
-                deadline = node.get_text(strip=True)
-                break
-        if not deadline:
-            m = re.search(r"(?:closing|deadline|apply by)[:\s]+([A-Za-z0-9 ,/\-]+)",
-                          soup.get_text("\n", strip=True), re.I)
-            if m:
-                deadline = m.group(1).strip()
-
-        extra: dict = {}
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string or "{}")
-            except Exception:
+            m = self._JOBLIST_RE.search(html)
+            if not m:
+                logger.warning("[gozambiajobs] No window.jobsList found on %s", url)
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                page += 1
                 continue
-            for node in (data if isinstance(data, list) else [data]):
-                if not isinstance(node, dict):
+
+            try:
+                page_jobs = json.loads(m.group(1))
+            except Exception as e:
+                logger.warning("[gozambiajobs] Failed to parse jobsList JSON on %s: %s", url, e)
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                page += 1
+                continue
+
+            if not page_jobs:
+                logger.info("[gozambiajobs] Page %d returned 0 jobs — assuming end of listing", page)
+                empty_streak += 1
+                if empty_streak >= 2:
+                    break
+                page += 1
+                continue
+            empty_streak = 0
+
+            new_on_page = 0
+            for job in page_jobs:
+                if max_jobs and yielded >= max_jobs:
+                    break
+
+                jid_raw = job.get("id")
+                if jid_raw is None or jid_raw in seen_ids_this_run:
                     continue
-                if str(node.get("@type", "")).lower() in ("jobposting",):
-                    extra["Job Title"]        = extra.get("Job Title") or sanitize_text(node.get("title", ""))
-                    extra["Date Posted"]      = extra.get("Date Posted") or node.get("datePosted", "")[:10]
-                    extra["Deadline"]         = extra.get("Deadline") or node.get("validThrough", "")[:10]
-                    extra["Job Location"]     = extra.get("Job Location") or sanitize_text(
-                        (node.get("jobLocation") or {}).get("address", {}).get("addressLocality", ""))
-                    extra["Salary Range"]     = extra.get("Salary Range") or sanitize_text(
-                        str(node.get("baseSalary", {}).get("value", "") or ""))
-                    extra["Job Type"]         = extra.get("Job Type") or sanitize_text(
-                        node.get("employmentType", ""))
-                    extra["Job Description"]  = extra.get("Job Description") or sanitize_text(
-                        node.get("description", ""))
-                    horg = node.get("hiringOrganization") or {}
-                    if not company_name and horg.get("name"):
-                        company_name = sanitize_text(horg["name"])
-                    if not logo and horg.get("logo"):
-                        logo = sanitize_text(horg["logo"], is_url=True)
+                seen_ids_this_run.add(jid_raw)
 
-        logger.debug("[gozambiajobs] title=%r  company=%r  location=%r  type=%r",
-                     title, company_name, location, job_type)
+                path = job.get("job_details_path") or f"/jobs/{jid_raw}"
+                job_url = sanitize_text(urljoin(self.base_url, path), is_url=True)
+                if not job_url or job_url in processed_urls:
+                    logger.debug("[gozambiajobs] Skipping already-seen URL: %s", job_url)
+                    continue
+                jid = make_job_id(job_url)
+                if jid in processed_ids:
+                    logger.debug("[gozambiajobs] Skipping already-processed ID %s", jid)
+                    continue
 
-        result = {
+                try:
+                    fields = self._record_from_job(job, job_url)
+                except Exception as e:
+                    logger.warning("[gozambiajobs] Failed to build record for job id=%s: %s",
+                                   jid_raw, e)
+                    continue
+
+                if not sanitize_text(fields.get("Job Title", "")):
+                    logger.warning("[gozambiajobs] No title for job id=%s — skipping", jid_raw)
+                    continue
+
+                new_on_page += 1
+                logger.info("[gozambiajobs] Extracted title: '%s'", fields["Job Title"])
+
+                record = empty_record()
+                record.update({k: v for k, v in fields.items() if v})
+                record["Job URL"] = job_url
+
+                # Mine any structured fields (qualifications, experience, etc.)
+                # straight out of the plain-text description.
+                mined = mine_fields(record.get("Job Description", ""))
+                for k, v in mined.items():
+                    if not sanitize_text(record.get(k, "")):
+                        record[k] = v
+
+                if not record.get("Company Name"):
+                    record["Company Name"] = _company_from_title(record.get("Job Title", ""))
+                if not record.get("Job Location"):
+                    record["Job Location"] = self.default_location
+                record["Job Type"] = normalise_job_type(record.get("Job Type", "")).replace("-", " ").title()
+                record["Date Posted"] = parse_date(record.get("Date Posted", ""), fallback_today=True)
+                record["Deadline"] = parse_date(record.get("Deadline", ""))
+                record["Estimated Deadline"] = estimated_deadline(
+                    record["Date Posted"], record["Deadline"])
+
+                raw_desc = record.get("Job Description", "")
+                cleaned_desc = clean_description(raw_desc)
+                if cleaned_desc != raw_desc:
+                    dropped = len(raw_desc) - len(cleaned_desc)
+                    logger.info(
+                        "[gozambiajobs] clean_description removed %d chars of noise from '%s'",
+                        dropped, record.get("Job Title", ""),
+                    )
+                record["Job Description"] = cleaned_desc
+
+                logger.info(
+                    "[gozambiajobs] Record ready — Company='%s' | Location='%s' | "
+                    "Posted='%s' | Deadline='%s' | Application=%r",
+                    record.get("Company Name", ""),
+                    record.get("Job Location", ""),
+                    record.get("Date Posted", ""),
+                    record.get("Estimated Deadline", ""),
+                    record.get("Application", "")[:60],
+                )
+
+                record["_job_id"] = jid
+                processed_ids.add(jid)
+                processed_urls.add(job_url)
+                yielded += 1
+                yield record
+
+            logger.info("[gozambiajobs] Page %d: %d new job(s) processed (total yielded %d)",
+                        page, new_on_page, yielded)
+            page += 1
+
+        logger.info("[GOZAMBIAJOBS] Scrape complete — yielded %d record(s)", yielded)
+
+    def _record_from_job(self, job: dict, job_url: str) -> dict:
+        title = _clean_title(sanitize_text(job.get("title", "")))
+
+        employer = job.get("employer") or {}
+        company_name = sanitize_text(employer.get("name", ""))
+        company_logo = sanitize_text(employer.get("logo") or "", is_url=True)
+        company_website = sanitize_text(employer.get("website") or "", is_url=True)
+        if company_website and not re.match(r"^https?://", company_website, re.I):
+            company_website = f"https://{company_website}"
+        company_details = sanitize_text(self._strip_html(employer.get("description") or ""))
+
+        job_location = job.get("job_location") or {}
+        location = sanitize_text(job_location.get("name", "")) or sanitize_text(job.get("location") or "")
+        # "Anywhere in Zambia" / "Remote" entries have no job_location object —
+        # fall back to the raw "location" string in that case (handled above).
+
+        category = job.get("category") or {}
+        job_field = sanitize_text(category.get("name", ""))
+
+        job_type = sanitize_text((job.get("job_type") or {}).get("title", ""))
+
+        description_html = job.get("description") or ""
+        description = self._strip_html(description_html)
+
+        application = self._extract_application(job, description_html, job_url)
+        salary = self._format_salary(job)
+
+        return {
             "Job Title":       title,
             "Company Name":    company_name,
-            "Company Logo":    logo,
-            "Job Location":    location or DEFAULT_LOCATION,
+            "Company Logo":    company_logo,
+            "Company Website": company_website,
+            "Company Details": company_details,
+            "Job Location":    location,
+            "Job Field":       job_field,
             "Job Type":        job_type,
-            "Deadline":        deadline,
-            "Date Posted":     extra.get("Date Posted") or _published(soup),
-            "Job Description": extra.get("Job Description") or _main_content(soup),
+            "Job Description": description,
+            "Application":     application,
+            "Date Posted":     (job.get("posted_at") or "")[:10],
+            "Salary Range":    salary,
         }
-        result.update({k: v for k, v in extra.items() if v and not result.get(k)})
-        return result
+
+    @staticmethod
+    def _extract_application(job: dict, description_html: str, job_url: str) -> str:
+        apply_by = (job.get("apply_by") or "").lower()
+        raw_apply_to = sanitize_text(job.get("apply_to") or "")
+
+        if apply_by == "by_email" and raw_apply_to:
+            return sanitize_text(raw_apply_to, is_email=True)
+        if apply_by == "by_link" and raw_apply_to and raw_apply_to.lower().startswith("http"):
+            return sanitize_text(raw_apply_to, is_url=True)
+
+        # "by_form" postings (and any case with no usable apply_to) often
+        # still mention a direct contact email or external link inside the
+        # job description body itself — mine it the same way we do for
+        # normal HTML detail pages, rather than falling back to the job
+        # board's own internal "Easy Apply" wall (which isn't a usable
+        # application route for a downstream listing).
+        mined = extract_application(description_html, job_url)
+        return mined
+
+    @staticmethod
+    def _format_salary(job: dict) -> str:
+        min_c = job.get("min_compensation")
+        max_c = job.get("max_compensation")
+        if not min_c and not max_c:
+            return ""
+        currency = (job.get("compensation_currency") or "").upper()
+        period = (job.get("compensation_time_frame") or "").strip()
+
+        def fmt(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return sanitize_text(str(v))
+            return f"{int(f):,}" if f == int(f) else f"{f:,.2f}"
+
+        if min_c and max_c and str(min_c) != str(max_c):
+            salary = f"{currency} {fmt(min_c)} - {fmt(max_c)}".strip()
+        else:
+            salary = f"{currency} {fmt(min_c or max_c)}".strip()
+        if period:
+            salary = f"{salary} / {period}"
+        return sanitize_text(salary)
+
+    @staticmethod
+    def _strip_html(html_fragment: str) -> str:
+        if not html_fragment:
+            return ""
+        soup = BeautifulSoup(html_fragment, "html.parser")
+        return soup.get_text("\n", strip=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
