@@ -385,6 +385,70 @@ def make_job_id(job_url: str, title: str = "", company: str = "") -> str:
     return hashlib.md5(seed.encode("utf-8")).hexdigest()[:16]
 
 
+# ── Cross-source content fingerprint ──────────────────────────────────────────
+# URL-based Job IDs only catch the *same URL* scraped twice. They can never
+# catch the *same job* posted on two different boards (jobwebzambia vs
+# gozambiajobs) because the URLs are always different. This fingerprint is
+# keyed on normalised title+company so we can catch that case too.
+_FP_NOISE_RE = re.compile(
+    r"\b(job|jobs|vacanc(?:y|ies)|position|opening|career|opportunit(?:y|ies)|"
+    r"urgent(?:ly)?|hiring|wanted|needed|new|latest|apply\s*now|full\s*time|"
+    r"part\s*time|x\d+|\(\d+\)|grade\s*\w+|in\s+(?:lusaka|kitwe|ndola|kabwe|"
+    r"livingstone|chingola|mufulira|luanshya|kasama|chipata|solwezi|mongu|"
+    r"zambia))\b",
+    re.I,
+)
+_FP_COMPANY_SUFFIX_RE = re.compile(
+    r"\b(plc|ltd|limited|inc|incorporated|corp|corporation|co|company|"
+    r"group|holdings|zambia)\b\.?",
+    re.I,
+)
+_FP_PUNCT_RE = re.compile(r"[^a-z0-9 ]+")
+
+
+def _fp_normalise(text: str) -> str:
+    text = sanitize_text(text).lower()
+    text = _FP_PUNCT_RE.sub(" ", text)
+    text = _FP_NOISE_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _fp_normalise_company(text: str) -> str:
+    """Stricter normaliser for company names: also strips legal-entity
+    suffixes (Plc, Ltd, Zambia, etc) that often differ between sources but
+    don't change the underlying company's identity."""
+    text = _fp_normalise(text)
+    text = _FP_COMPANY_SUFFIX_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def make_fingerprint(title: str, company: str) -> str:
+    """Stable key for an *exact* normalised title+company match."""
+    norm_title = _fp_normalise(title)
+    norm_company = _fp_normalise_company(company)
+    seed = f"{norm_title}|{norm_company}"
+    return hashlib.md5(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def fingerprint_similarity(title_a: str, company_a: str, title_b: str, company_b: str) -> float:
+    """
+    Fuzzy similarity between two (title, company) pairs, used to catch
+    near-duplicates that survive normalisation (slightly reworded titles,
+    abbreviated company names, etc). Returns 0.0-1.0.
+    """
+    t_sim = _similarity(_fp_normalise(title_a), _fp_normalise(title_b))
+    c_a, c_b = _fp_normalise_company(company_a), _fp_normalise_company(company_b)
+    if c_a and c_b:
+        c_sim = _similarity(c_a, c_b)
+    else:
+        # Missing company on one/both sides — fall back to title-only signal
+        c_sim = t_sim
+    # Title carries most of the signal; company corroborates it.
+    return (t_sim * 0.75) + (c_sim * 0.25)
+
+
 def normalise_job_type(raw: str) -> str:
     raw = sanitize_text(raw).lower()
     for key, val in JOB_TYPE_MAPPING.items():
@@ -1069,7 +1133,7 @@ class WordPressClient:
 # Dedupe + status tracker
 # ════════════════════════════════════════════════════════════════════════════
 _TRACKER_COLUMNS = ["Job ID", "Source", "Job URL", "Job Title", "Company Name",
-                    "Status", "Timestamp"]
+                    "Fingerprint", "Status", "Timestamp"]
 
 
 def _tracker_init():
@@ -1099,6 +1163,34 @@ def tracker_load() -> tuple[set, set]:
     return ids, urls
 
 
+def tracker_load_fingerprints() -> tuple[set, list[dict]]:
+    """
+    Returns:
+      - exact_fps: set of exact fingerprint strings already seen (any source,
+        any prior run), for O(1) exact-match lookup.
+      - fuzzy_index: list of {fingerprint, title, company, source} dicts for
+        records that were actually posted/read (not failed/skipped), used for
+        a fuzzy similarity pass to catch near-duplicate titles across sites.
+    """
+    rows = _tracker_rows()
+    exact_fps: set = set()
+    fuzzy_index: list[dict] = []
+    for r in rows:
+        fp = (r.get("Fingerprint") or "").strip()
+        status = (r.get("Status") or "").split("|")[0]
+        if not fp:
+            continue
+        exact_fps.add(fp)
+        if status in ("read", "posted"):
+            fuzzy_index.append({
+                "fingerprint": fp,
+                "title": r.get("Job Title", ""),
+                "company": r.get("Company Name", ""),
+                "source": r.get("Source", ""),
+            })
+    return exact_fps, fuzzy_index
+
+
 def _tracker_upsert(job_id: str, updates: dict):
     rows = _tracker_rows()
     for r in rows:
@@ -1114,9 +1206,12 @@ def _tracker_upsert(job_id: str, updates: dict):
     _tracker_write(rows)
 
 
-def tracker_mark_read(job_id, source, job_url, title, company):
-    _tracker_upsert(job_id, {"Source": source, "Job URL": job_url, "Job Title": title,
-                             "Company Name": company, "Status": "read"})
+def tracker_mark_read(job_id, source, job_url, title, company, fingerprint=""):
+    _upsert_updates = {"Source": source, "Job URL": job_url, "Job Title": title,
+                       "Company Name": company, "Status": "read"}
+    if fingerprint:
+        _upsert_updates["Fingerprint"] = fingerprint
+    _tracker_upsert(job_id, _upsert_updates)
 
 
 def tracker_mark_posted(job_id, wp_id, wp_url):
@@ -1804,12 +1899,20 @@ def main():
     logger.info("Tracker: %d previously processed IDs / %d URLs loaded",
                 len(processed_ids), len(processed_urls))
 
+    # Cross-source content dedup: catches the same job posted on two
+    # different boards (different URLs -> different Job IDs), which the
+    # URL-based tracker above can never catch on its own.
+    seen_fingerprints, fingerprint_index = tracker_load_fingerprints()
+    logger.info("Tracker: %d fingerprints loaded (%d available for fuzzy match)",
+                len(seen_fingerprints), len(fingerprint_index))
+    FUZZY_DUP_THRESHOLD = 0.86  # similarity score above which two postings count as the same job
+
     global_stats: dict[str, dict[str, int]] = {}
 
     for source_key in args.sources:
         cls     = SOURCE_REGISTRY[source_key]
         scraper = cls(http)
-        stats   = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
+        stats   = {"scraped": 0, "skipped_no_app": 0, "skipped_duplicate": 0, "posted": 0, "failed": 0}
         global_stats[source_key] = stats
 
         logger.info("")
@@ -1822,14 +1925,56 @@ def main():
             jid     = rec.pop("_job_id")
             title   = rec.get("Job Title", "")
             company = rec.get("Company Name", "")
+            fp      = make_fingerprint(title, company)
 
-            tracker_mark_read(jid, source_key, rec.get("Job URL", ""), title, company)
+            tracker_mark_read(jid, source_key, rec.get("Job URL", ""), title, company, fingerprint=fp)
             stats["scraped"] += 1
 
             logger.info(
                 "[%s] ── Job #%d ──  '%s'  @  '%s'",
                 source_key, stats["scraped"], title, company,
             )
+
+            # ── Cross-source duplicate check ────────────────────────────────
+            # 1) Exact match: identical normalised title+company already seen
+            #    (this run or a previous run, any source).
+            # 2) Fuzzy match: near-identical title+company (handles slightly
+            #    reworded titles or abbreviated company names between sites).
+            is_dup = False
+            dup_reason = ""
+            if fp in seen_fingerprints:
+                is_dup = True
+                dup_reason = "exact fingerprint match"
+            else:
+                for prior in fingerprint_index:
+                    if prior["source"] == source_key:
+                        continue  # same-source repeats are already caught by URL/Job ID
+                    sim = fingerprint_similarity(title, company, prior["title"], prior["company"])
+                    if sim >= FUZZY_DUP_THRESHOLD:
+                        is_dup = True
+                        dup_reason = (
+                            f"fuzzy match (sim={sim:.2f}) with '{prior['title']}' "
+                            f"@ '{prior['company']}' from [{prior['source']}]"
+                        )
+                        break
+
+            if is_dup:
+                logger.info(
+                    "[%s] Duplicate job skipped — '%s' @ '%s' — %s",
+                    source_key, title, company, dup_reason,
+                )
+                tracker_mark_failed(jid, f"duplicate|{dup_reason}"[:120])
+                stats.setdefault("skipped_duplicate", 0)
+                stats["skipped_duplicate"] += 1
+                continue
+
+            # Record this fingerprint immediately so later jobs in the SAME
+            # run (including from other sources processed afterwards) also
+            # see it, not just fingerprints loaded from prior runs.
+            seen_fingerprints.add(fp)
+            fingerprint_index.append({
+                "fingerprint": fp, "title": title, "company": company, "source": source_key,
+            })
 
             # ── Enrichment ───────────────────────────────────────────────────
             if _needs_enrichment(rec):
@@ -1897,31 +2042,32 @@ def main():
 
     # ── Per-source summary ─────────────────────────────────────────────────
     logger.info("")
-    logger.info("╔══════════════════════════════════════════════════════════╗")
-    logger.info("║                    PER-SOURCE SUMMARY                   ║")
-    logger.info("╠══════════════════════════════════════════════════════════╣")
-    total = {"scraped": 0, "skipped_no_app": 0, "posted": 0, "failed": 0}
+    logger.info("╔════════════════════════════════════════════════════════════════════╗")
+    logger.info("║                          PER-SOURCE SUMMARY                          ║")
+    logger.info("╠════════════════════════════════════════════════════════════════════╣")
+    total = {"scraped": 0, "skipped_no_app": 0, "skipped_duplicate": 0, "posted": 0, "failed": 0}
     for src, s in global_stats.items():
         logger.info(
-            "║  %-16s  scraped=%-4d  posted=%-4d  skip=%-4d  fail=%-4d  ║",
-            src, s["scraped"], s["posted"], s["skipped_no_app"], s["failed"],
+            "║  %-16s scraped=%-4d posted=%-4d skip_app=%-4d dup=%-4d fail=%-4d  ║",
+            src, s["scraped"], s["posted"], s["skipped_no_app"],
+            s.get("skipped_duplicate", 0), s["failed"],
         )
         for k in total:
-            total[k] += s[k]
-    logger.info("╠══════════════════════════════════════════════════════════╣")
+            total[k] += s.get(k, 0)
+    logger.info("╠════════════════════════════════════════════════════════════════════╣")
     logger.info(
-        "║  %-16s  scraped=%-4d  posted=%-4d  skip=%-4d  fail=%-4d  ║",
+        "║  %-16s scraped=%-4d posted=%-4d skip_app=%-4d dup=%-4d fail=%-4d  ║",
         "TOTAL", total["scraped"], total["posted"],
-        total["skipped_no_app"], total["failed"],
+        total["skipped_no_app"], total["skipped_duplicate"], total["failed"],
     )
-    logger.info("╚══════════════════════════════════════════════════════════╝")
+    logger.info("╚════════════════════════════════════════════════════════════════════╝")
 
     tracker_summary()
     logger.info(
-        "DONE %s | total scraped=%d posted=%d skipped=%d failed=%d",
+        "DONE %s | total scraped=%d posted=%d skipped_no_app=%d skipped_duplicate=%d failed=%d",
         datetime.now().strftime("%Y-%m-%d %H:%M"),
         total["scraped"], total["posted"],
-        total["skipped_no_app"], total["failed"],
+        total["skipped_no_app"], total["skipped_duplicate"], total["failed"],
     )
 
 
