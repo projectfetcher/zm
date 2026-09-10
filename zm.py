@@ -24,6 +24,19 @@ except Exception:                     # pragma: no cover
 
 from bs4 import BeautifulSoup
 
+# --- Internal bot auth header (added for Cloudflare Bot Fight Mode allowlist) ---
+INTERNAL_BOT_KEY = os.environ.get("INTERNAL_BOT_KEY", "")
+if INTERNAL_BOT_KEY:
+    _wp_host_hint = os.environ.get("WP_BASE_URL", "").split("//")[-1].split("/")[0]
+    _orig_session_request = requests.Session.request
+    def _internal_auth_patched_request(self, method, url, *args, **kwargs):
+        if not _wp_host_hint or _wp_host_hint in str(url):
+            headers = dict(kwargs.get("headers") or {})
+            headers.setdefault("X-Internal-Auth", INTERNAL_BOT_KEY)
+            kwargs["headers"] = headers
+        return _orig_session_request(self, method, url, *args, **kwargs)
+    requests.Session.request = _internal_auth_patched_request
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
