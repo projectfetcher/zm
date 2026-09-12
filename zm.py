@@ -982,7 +982,7 @@ class WordPressClient:
 
     def _headers(self):
         token = base64.b64encode(f"{self.user}:{self.app_pw}".encode()).decode()
-        return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+        return {"Authorization": f"Basic {token}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
 
     @staticmethod
     def _slug(name: str, limit: int = 80) -> str:
